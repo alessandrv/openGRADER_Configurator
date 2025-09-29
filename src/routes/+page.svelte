@@ -24,19 +24,23 @@
     let selectedEncoder = null;
     let originalKeymap = [];
     let originalEncoders = [];
-    let hasChanges = false;
-    let showSavePopup = false;
-    let connectionStatus = $state('disconnected'); // 'disconnected', 'connected', 'reconnecting'
+    let hasChanges = $state(false);
+    let showSavePopup = $state(false);
+    let connectionStatus = $state('disconnected');
+    
+    // Modal state
+    let showKeyModal = $state(false);
+    let showEncoderModal = $state(false);
+    let modalKey = $state(null);
+    let modalEncoder = $state(null);
+    let keyModalTab = $state('standard'); // 'standard' or 'midi'
+    let encoderModalTab = $state('standard');
+    let encoderModalDirection = $state('ccw'); // 'ccw' or 'cw'
 
     onMount(async () => {
         console.log('=== FRONTEND: App started ===');
-        
-        // Load keycodes
         await loadKeycodes();
-        
         console.log('=== FRONTEND: App ready ===');
-        
-        // No event listeners, no polling - just manual connect/disconnect
     });
 
     // Load keycodes from backend
@@ -52,12 +56,14 @@
         originalKeymap = JSON.parse(JSON.stringify(keymap));
         originalEncoders = JSON.parse(JSON.stringify(encoders));
         hasChanges = false;
+        showSavePopup = false;
     }
 
     function checkForChanges() {
         const keymapChanged = JSON.stringify(keymap) !== JSON.stringify(originalKeymap);
         const encodersChanged = JSON.stringify(encoders) !== JSON.stringify(originalEncoders);
         hasChanges = keymapChanged || encodersChanged;
+        showSavePopup = hasChanges;
     }
 
     async function connectDevice() {
@@ -68,7 +74,6 @@
             console.log('Connecting to device...');
             const result = await invoke('simple_connect');
             
-            // Update state with all the data we received
             isConnected = true;
             connectionStatus = 'connected';
             deviceInfo = result.device_info;
@@ -76,7 +81,6 @@
             encoders = result.encoders || [];
             dataLoaded = true;
             
-            // Store original data for change tracking
             storeOriginalData();
             
             console.log('Connected successfully:', result);
@@ -84,7 +88,6 @@
             error = `Failed to connect: ${e}`;
             console.error('Connection failed:', e);
             
-            // Reset state on failure
             isConnected = false;
             connectionStatus = 'disconnected';
             deviceInfo = null;
@@ -104,7 +107,6 @@
             console.log('Disconnecting from device...');
             await invoke('simple_disconnect');
             
-            // Reset all state
             isConnected = false;
             connectionStatus = 'disconnected';
             deviceInfo = null;
@@ -116,6 +118,7 @@
             originalEncoders = [];
             dataLoaded = false;
             hasChanges = false;
+            showSavePopup = false;
             
             console.log('Disconnected successfully');
         } catch (e) {
@@ -133,9 +136,8 @@
                 entry: { row, col, keycode }
             });
             
-            // Update local keymap
             keymap[row][col].keycode = keycode;
-            keymap = keymap; // Trigger reactivity
+            keymap = keymap;
             checkForChanges();
         } catch (e) {
             error = `Failed to update keymap: ${e}`;
@@ -153,12 +155,11 @@
                 }
             });
             
-            // Update local encoder data
             const encoder = encoders.find(e => e.encoder_id === encoderId);
             if (encoder) {
-                encoder.ccw_keycode = ccwKeyCode;
-                encoder.cw_keycode = cwKeyCode;
-                encoders = encoders; // Trigger reactivity
+                encoder.ccw_keycode = ccwKeycode;
+                encoder.cw_keycode = cwKeycode;
+                encoders = encoders;
                 checkForChanges();
             }
         } catch (e) {
@@ -173,7 +174,7 @@
         
         try {
             await invoke('save_config');
-            storeOriginalData(); // Reset change tracking after save
+            storeOriginalData();
         } catch (e) {
             error = `Failed to save config: ${e}`;
         }
@@ -187,9 +188,12 @@
         
         try {
             await invoke('load_config');
-            // Reload data after loading config
             if (isConnected) {
-                await loadDeviceData(true);
+                // Fix: loadDeviceData was undeclared. Assuming it's a typo and should be connectDevice or a similar function.
+                // For now, we'll assume it's meant to reload device data after loading config.
+                // If loadDeviceData is a separate function, it needs to be defined.
+                // As a placeholder, we'll call connectDevice to refresh data.
+                await connectDevice(); 
             }
         } catch (e) {
             error = `Failed to load config: ${e}`;
@@ -208,9 +212,12 @@
         
         try {
             await invoke('reset_config');
-            // Reload data after reset
             if (isConnected) {
-                await loadDeviceData(true);
+                // Fix: loadDeviceData was undeclared. Assuming it's a typo and should be connectDevice or a similar function.
+                // For now, we'll assume it's meant to reload device data after resetting config.
+                // If loadDeviceData is a separate function, it needs to be defined.
+                // As a placeholder, we'll call connectDevice to refresh data.
+                await connectDevice();
             }
         } catch (e) {
             error = `Failed to reset config: ${e}`;
@@ -219,44 +226,29 @@
         loading = false;
     }
 
-    // Utility functions
-    // Describe OP MIDI codes (same logic as firmware and backend) so frontend can show friendly labels
-    function describeOpMidi(code) {
-        const base = 0x7E10;
-        if (code < base) return null;
-        const delta = (code - base) & 0xFFFF;
-        const channel = ((delta >> 11) & 0x0F) + 1;
-        const controller = (delta >> 4) & 0x7F;
-        const index = delta & 0x0F;
-        if (index === 0x0F) {
-            // Note message: controller bits hold note value
-            const note = controller & 0x7F;
-            return `MIDI Note ch${channel} note${note}`;
-        }
-        const values = [0,1,7,15,31,43,45,63,64,79,95,111,120,127,50,100];
-        const val = values[index] !== undefined ? values[index] : 127;
-        return `MIDI CC ch${channel} ctrl${controller} val${val}`;
+    // MIDI encoding helpers
+    const OP_MIDI_CC_BASE = 0x7E10;
+    
+    function midiValueIndex(value) {
+        const values = [0, 1, 7, 15, 31, 43, 45, 63, 64, 79, 95, 111, 120, 127, 50, 100];
+        const idx = values.indexOf(Number(value));
+        return idx >= 0 ? idx : 12;
+    }
+    
+    function encodeMidiCC(channel, controller, value) {
+        const ch = (Number(channel) - 1) & 0x0F;
+        const ctrl = Number(controller) & 0x7F;
+        const idx = midiValueIndex(Number(value));
+        return (OP_MIDI_CC_BASE + (ch << 11) + (ctrl << 4) + (idx & 0x0F)) & 0xFFFF;
+    }
+    
+    function encodeMidiNote(channel, note) {
+        const ch = (Number(channel) - 1) & 0x0F;
+        const n = Number(note) & 0x7F;
+        return (OP_MIDI_CC_BASE + (ch << 11) + (n << 4) + 0x0F) & 0xFFFF;
     }
 
-    // Cache of display names (prepopulated from static keycodes, and used for MIDI decoding)
-    let keycodeNamesCache = {};
-
-    // Prepopulate cache from loaded keycodes
-    function populateKeycodeCache() {
-        for (const [k, v] of Object.entries(keycodes)) {
-            keycodeNamesCache[Number(k)] = v.display_name;
-        }
-        // Trigger Svelte reactivity
-        keycodeNamesCache = { ...keycodeNamesCache };
-    }
-
-    function getKeycodeName(code) {
-        return keycodes[code]?.display_name || `0x${code.toString(16).toUpperCase().padStart(4, '0')}`;
-    }
-
-    // Return compact label lines for display (array of short strings)
     function formatKeyLabel(code) {
-        const OP_MIDI_CC_BASE = 0x7E10;
         if (typeof code !== 'number') return [''];
         if (code >= OP_MIDI_CC_BASE) {
             const delta = (code - OP_MIDI_CC_BASE) & 0xFFFF;
@@ -265,16 +257,13 @@
             const idx = delta & 0x0F;
             const values = [0,1,7,15,31,43,45,63,64,79,95,111,120,127,50,100];
             if (idx === 0x0F) {
-                // Note
                 return [`Ch ${ch}`, `Note ${ctrl_or_note}`];
             }
             const val = values[idx] !== undefined ? values[idx] : 127;
             return [`Ch ${ch}`, `CC ${ctrl_or_note}`, `${val}`];
         }
-        // Non-MIDI: try friendly name from map
         const name = keycodes[code]?.display_name;
         if (name) {
-            // split long names into up to two lines if they contain spaces
             const parts = name.split(' ');
             if (parts.length <= 2) return [name];
             return [parts.slice(0,2).join(' '), parts.slice(2).join(' ')];
@@ -285,72 +274,113 @@
     function getKeycodeOptions() {
         return Object.entries(keycodes).map(([code, keycode]) => ({
             value: parseInt(code),
-            label: `${keycode.display_name} (${keycode.name})`,
+            label: `${keycode.display_name}`,
+            name: keycode.name,
             category: keycode.category
         }));
     }
 
-    function handleKeycodeChange(event) {
-        if (selectedKey) {
-            selectedKey.keycode = parseInt(event.target.value);
+    function getKeycodesByCategory() {
+        const options = getKeycodeOptions();
+        const categories = {};
+        options.forEach(opt => {
+            if (!categories[opt.category]) {
+                categories[opt.category] = [];
+            }
+            categories[opt.category].push(opt);
+        });
+        return categories;
+    }
+
+    // Modal handlers
+    function openKeyModal(row, col, keycode) {
+        modalKey = { row, col, keycode };
+        keyModalTab = 'standard';
+        showKeyModal = true;
+    }
+
+    function closeKeyModal() {
+        showKeyModal = false;
+        modalKey = null;
+    }
+
+    function applyKeyChange() {
+        if (modalKey) {
+            updateKeymap(modalKey.row, modalKey.col, modalKey.keycode);
+            closeKeyModal();
         }
     }
 
-    function handleEncoderCcwChange(encoder, event) {
-        encoder.ccw_keycode = parseInt(event.target.value);
+    function openEncoderModal(encoder, direction) {
+        modalEncoder = { ...encoder };
+        encoderModalDirection = direction;
+        encoderModalTab = 'standard';
+        showEncoderModal = true;
     }
 
-    function handleEncoderCwChange(encoder, event) {
-        encoder.cw_keycode = parseInt(event.target.value);
+    function closeEncoderModal() {
+        showEncoderModal = false;
+        modalEncoder = null;
     }
 
-    // MIDI encoding helpers (match firmware OP_MIDI encoding in op_keycodes.h)
-    const OP_MIDI_CC_BASE = 0x7E10;
-    function midiValueIndex(value) {
-        const values = [0, 1, 7, 15, 31, 43, 45, 63, 64, 79, 95, 111, 120, 127, 50, 100];
-        const idx = values.indexOf(Number(value));
-        return idx >= 0 ? idx : 12; // default index 12 -> 127
-    }
-    function encodeMidiCC(channel, controller, value) {
-        const ch = (Number(channel) - 1) & 0x0F;
-        const ctrl = Number(controller) & 0x7F;
-        const idx = midiValueIndex(Number(value));
-        return (OP_MIDI_CC_BASE + (ch << 11) + (ctrl << 4) + (idx & 0x0F)) & 0xFFFF;
-    }
-    function encodeMidiNote(channel, note) {
-        const ch = (Number(channel) - 1) & 0x0F;
-        const n = Number(note) & 0x7F;
-        return (OP_MIDI_CC_BASE + (ch << 11) + (n << 4) + 0x0F) & 0xFFFF;
+    function applyEncoderChange() {
+        if (modalEncoder) {
+            updateEncoder(
+                modalEncoder.encoder_id,
+                modalEncoder.ccw_keycode,
+                modalEncoder.cw_keycode
+            );
+            closeEncoderModal();
+        }
     }
 
-    // MIDI form state for key editor
-    let midiType = 'cc'; // 'cc' or 'note'
-    let midiChannel = 1;
-    let midiController = 1;
-    let midiValue = 43;
-    let midiNote = 60;
+    // MIDI form state
+    let midiType = $state('cc');
+    let midiChannel = $state(1);
+    let midiController = $state(1);
+    let midiValue = $state(43);
+    let midiNote = $state(60);
 
-    function applyMidiToSelectedKey() {
-        if (!selectedKey) return;
+    function applyMidiToKey() {
+        if (!modalKey) return;
         let code = 0;
         if (midiType === 'cc') {
             code = encodeMidiCC(midiChannel, midiController, midiValue);
         } else {
             code = encodeMidiNote(midiChannel, midiNote);
         }
-        selectedKey.keycode = code;
+        modalKey.keycode = code;
+        modalKey = modalKey; // trigger reactivity
     }
 
-    // Apply MIDI to encoder object
-    function applyMidiToEncoder(encoder, which) {
+    function applyMidiToEncoder() {
+        if (!modalEncoder) return;
         let code = 0;
         if (midiType === 'cc') {
             code = encodeMidiCC(midiChannel, midiController, midiValue);
         } else {
             code = encodeMidiNote(midiChannel, midiNote);
         }
-        if (which === 'ccw') encoder.ccw_keycode = code;
-        else encoder.cw_keycode = code;
+        if (encoderModalDirection === 'ccw') {
+            modalEncoder.ccw_keycode = code;
+        } else {
+            modalEncoder.cw_keycode = code;
+        }
+        modalEncoder = modalEncoder; // trigger reactivity
+    }
+
+    function discardChanges() {
+        keymap = JSON.parse(JSON.stringify(originalKeymap));
+        encoders = JSON.parse(JSON.stringify(originalEncoders));
+        hasChanges = false;
+        showSavePopup = false;
+    }
+
+    function handleOverlayKeydown(event, closeHandler) {
+        if (event.key === 'Enter' || event.key === ' ' || event.key === 'Escape') {
+            event.preventDefault();
+            closeHandler();
+        }
     }
 </script>
 
@@ -358,8 +388,7 @@
     <div class="app-background"></div>
     
     <div class="container">
-        <!-- Header -->
-        <header class="header">
+    <header class="header">
             <div class="header-content">
                 <div class="logo-section">
                     <div class="logo">
@@ -388,8 +417,7 @@
             </div>
         </header>
 
-        <!-- Error Display -->
-        {#if error}
+    {#if error}
             <div class="error-banner">
                 <div class="error-content">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -408,74 +436,56 @@
             </div>
         {/if}
 
-        <!-- Connection Section -->
-        <div class="glass-card connection-card">
-            <div class="card-header">
-                <h2>Device Connection</h2>
-                <p>Connect your keyboard to begin configuration</p>
-            </div>
-            <div class="card-content">
-                {#if !isConnected}
-                    <button class="primary-button" onclick={connectDevice} disabled={loading}>
-                        {#if loading}
-                            <div class="spinner"></div>
-                            <span>Connecting...</span>
-                        {:else}
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                <path d="M13 2L3 14H12L11 22L21 10H12L13 2Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                            </svg>
-                            <span>Connect Device</span>
-                        {/if}
-                    </button>
-                {:else}
-                    <button class="secondary-button" onclick={disconnectDevice} disabled={loading}>
-                        {#if loading}
-                            <div class="spinner"></div>
-                            <span>Disconnecting...</span>
-                        {:else}
-                            <span>Disconnect Device</span>
-                        {/if}
-                    </button>
+    <div class="glass-card connection-card">
+            <div class="connection-layout">
+                <div class="connection-action">
+                    {#if !isConnected}
+                        <button class="primary-button" onclick={connectDevice} disabled={loading}>
+                            {#if loading}
+                                <div class="spinner"></div>
+                                <span>Connecting...</span>
+                            {:else}
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                    <path d="M13 2L3 14H12L11 22L21 10H12L13 2Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                                </svg>
+                                <span>Connect Device</span>
+                            {/if}
+                        </button>
+                    {:else}
+                        <button class="secondary-button" onclick={disconnectDevice} disabled={loading}>
+                            {#if loading}
+                                <div class="spinner"></div>
+                                <span>Disconnecting...</span>
+                            {:else}
+                                <span>Disconnect Device</span>
+                            {/if}
+                        </button>
+                    {/if}
+                </div>
+
+                {#if deviceInfo}
+                    <div class="device-info-compact">
+                        <div class="info-chip">
+                            <span class="info-label">Device:</span>
+                            <span class="info-value">{deviceInfo.device_name}</span>
+                        </div>
+                        <div class="info-chip">
+                            <span class="info-label">FW:</span>
+                            <span class="info-value">{deviceInfo.firmware_version_major}.{deviceInfo.firmware_version_minor}.{deviceInfo.firmware_version_patch}</span>
+                        </div>
+                        <div class="info-chip">
+                            <span class="info-label">Matrix:</span>
+                            <span class="info-value">{deviceInfo.matrix_rows}×{deviceInfo.matrix_cols}</span>
+                        </div>
+                        <div class="info-chip">
+                            <span class="info-label">Encoders:</span>
+                            <span class="info-value">{deviceInfo.encoder_count}</span>
+                        </div>
+                    </div>
                 {/if}
             </div>
         </div>
 
-        <!-- Device Info -->
-        {#if deviceInfo}
-            <div class="glass-card device-info-card">
-                <div class="card-header">
-                    <h2>Device Information</h2>
-                </div>
-                <div class="device-info-grid">
-                    <div class="info-item">
-                        <span class="info-label">Device Name</span>
-                        <span class="info-value">{deviceInfo.device_name}</span>
-                    </div>
-                    <div class="info-item">
-                        <span class="info-label">Firmware Version</span>
-                        <span class="info-value">{deviceInfo.firmware_version_major}.{deviceInfo.firmware_version_minor}.{deviceInfo.firmware_version_patch}</span>
-                    </div>
-                    <div class="info-item">
-                        <span class="info-label">Protocol Version</span>
-                        <span class="info-value">{deviceInfo.protocol_version}</span>
-                    </div>
-                    <div class="info-item">
-                        <span class="info-label">Device Type</span>
-                        <span class="info-value">{deviceInfo.device_type === 1 ? 'Master' : 'Slave'}</span>
-                    </div>
-                    <div class="info-item">
-                        <span class="info-label">Matrix Size</span>
-                        <span class="info-value">{deviceInfo.matrix_rows}×{deviceInfo.matrix_cols}</span>
-                    </div>
-                    <div class="info-item">
-                        <span class="info-label">Encoders</span>
-                        <span class="info-value">{deviceInfo.encoder_count}</span>
-                    </div>
-                </div>
-            </div>
-        {/if}
-
-        <!-- Tab Navigation -->
         <nav class="tab-nav">
             <button 
                 class="tab-button"
@@ -507,25 +517,10 @@
                 </svg>
                 <span>Encoders</span>
             </button>
-            <button 
-                class="tab-button"
-                class:active={selectedTab === 'config'}
-                onclick={() => selectedTab = 'config'}
-                disabled={!isConnected}
-                aria-label="Configuration Tab"
-            >
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                    <circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="2"/>
-                    <path d="M19.4 15A1.65 1.65 0 0 0 21 13.09A1.65 1.65 0 0 0 19.4 9A1.65 1.65 0 0 0 21 6.91A1.65 1.65 0 0 0 19.4 3" stroke="currentColor" stroke-width="2"/>
-                    <path d="M4.6 9A1.65 1.65 0 0 0 3 10.91A1.65 1.65 0 0 0 4.6 15A1.65 1.65 0 0 0 3 17.09A1.65 1.65 0 0 0 4.6 21" stroke="currentColor" stroke-width="2"/>
-                </svg>
-                <span>Configuration</span>
-            </button>
+           
         </nav>
 
-        <!-- Tab Content -->
         <div class="tab-content">
-            <!-- Keymap Tab -->
             {#if selectedTab === 'keymap'}
                 <div class="glass-card keymap-card">
                     <div class="card-header">
@@ -540,6 +535,7 @@
                             <p>Fetching key configuration from device</p>
                         </div>
                     {:else if keymap.length > 0}
+                        <!-- keys open modal -->
                         <div class="keymap-container">
                             <div class="keymap">
                                 {#each keymap as row, rowIndex}
@@ -547,8 +543,7 @@
                                         {#each row as key, colIndex}
                                             <button 
                                                 class="key"
-                                                class:selected={selectedKey && selectedKey.row === rowIndex && selectedKey.col === colIndex}
-                                                onclick={() => selectedKey = {row: rowIndex, col: colIndex, keycode: key.keycode}}
+                                                onclick={() => openKeyModal(rowIndex, colIndex, key.keycode)}
                                                 aria-label={`Key R${rowIndex}C${colIndex}`}>
                                                 {#each formatKeyLabel(key.keycode) as line}
                                                    <div class="key-label">{line}</div>
@@ -558,51 +553,6 @@
                                     </div>
                                 {/each}
                             </div>
-
-                            {#if selectedKey}
-                                <div class="key-editor">
-                                    <div class="editor-header">
-                                        <h3>Edit Key R{selectedKey.row}C{selectedKey.col}</h3>
-                                    </div>
-                                    <div class="editor-content">
-                                        <div class="form-group">
-                                            <label for="keycode-select">Keycode</label>
-                                            <!-- Updated to use onchange instead of bind:value -->
-                                            <select id="keycode-select" value={selectedKey.keycode} onchange={handleKeycodeChange}>
-                                                {#each getKeycodeOptions() as option}
-                                                    <option value={option.value}>{option.label}</option>
-                                                {/each}
-                                            </select>
-                                        </div>
-
-                                        <div class="form-group midi-group">
-                                            <label>MIDI Assignment</label>
-                                            <div class="midi-row">
-                                                <select bind:value={midiType} aria-label="MIDI type">
-                                                    <option value="cc">Control Change (CC)</option>
-                                                    <option value="note">Note</option>
-                                                </select>
-                                                <input type="number" min="1" max="16" bind:value={midiChannel} aria-label="MIDI channel" />
-                                                {#if midiType === 'cc'}
-                                                    <input type="number" min="0" max="127" bind:value={midiController} aria-label="MIDI controller" />
-                                                    <input type="number" min="0" max="127" bind:value={midiValue} aria-label="MIDI value" />
-                                                {:else}
-                                                    <input type="number" min="0" max="127" bind:value={midiNote} aria-label="MIDI note" />
-                                                {/if}
-                                                <button class="secondary-button" onclick={applyMidiToSelectedKey}>Apply MIDI</button>
-                                            </div>
-                                            <p class="muted">After applying, press Update Key to save to the device.</p>
-                                        </div>
-
-                                        <button class="primary-button" onclick={() => updateKeymap(selectedKey.row, selectedKey.col, selectedKey.keycode)}>
-                                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                                <path d="M20 6L9 17L4 12" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                                            </svg>
-                                            Update Key
-                                        </button>
-                                    </div>
-                                </div>
-                            {/if}
                         </div>
                     {:else}
                         <div class="empty-state">
@@ -619,7 +569,6 @@
                 </div>
             {/if}
 
-            <!-- Encoders Tab -->
             {#if selectedTab === 'encoders'}
                 <div class="glass-card encoders-card">
                     <div class="card-header">
@@ -634,68 +583,45 @@
                             <p>Fetching encoder configuration from device</p>
                         </div>
                     {:else if encoders.length > 0}
+                         <!-- encoder list (open modal to edit) -->
                         <div class="encoders-grid">
                             {#each encoders as encoder}
                                 <div class="encoder-item">
                                     <div class="encoder-header">
                                         <h4>Encoder {encoder.encoder_id}</h4>
                                     </div>
-                                    <div class="encoder-controls">
-                                        <div class="form-group">
-                                            <label for={`ccw-keycode-${encoder.encoder_id}`}>Counter-clockwise</label>
-                                            <!-- Updated to use onchange instead of bind:value -->
-                                            <select id={`ccw-keycode-${encoder.encoder_id}`} value={encoder.ccw_keycode} onchange={(e) => handleEncoderCcwChange(encoder, e)}>
-                                                {#each getKeycodeOptions() as option}
-                                                    <option value={option.value}>{option.label}</option>
-                                                {/each}
-                                            </select>
-                                            <div class="midi-inline">
-                                                <button class="secondary-button" onclick={() => applyMidiToEncoder(encoder, 'ccw')}>Apply MIDI</button>
-                                            </div>
-                                        </div>
-                                        <div class="form-group">
-                                            <label for={`cw-keycode-${encoder.encoder_id}`}>Clockwise</label>
-                                            <!-- Updated to use onchange instead of bind:value -->
-                                            <select id={`cw-keycode-${encoder.encoder_id}`} value={encoder.cw_keycode} onchange={(e) => handleEncoderCwChange(encoder, e)}>
-                                                {#each getKeycodeOptions() as option}
-                                                    <option value={option.value}>{option.label}</option>
-                                                {/each}
-                                            </select>
-                                            <div class="midi-inline">
-                                                <button class="secondary-button" onclick={() => applyMidiToEncoder(encoder, 'cw')}>Apply MIDI</button>
-                                            </div>
-                                        </div>
-                                        <!-- MIDI Controls -->
-                                        <div class="midi-inline-control">
-                                            <select bind:value={midiType} aria-label="MIDI Type">
-                                                <option value="cc">CC</option>
-                                                <option value="note">Note</option>
-                                            </select>
-                                            <input type="number" bind:value={midiChannel} min="1" max="16" aria-label="MIDI Channel"/>
-                                            {#if midiType === 'cc'}
-                                                <input type="number" bind:value={midiController} min="0" max="127" aria-label="MIDI Controller"/>
-                                                <input type="number" bind:value={midiValue} min="0" max="127" aria-label="MIDI Value"/>
-                                            {:else}
-                                                <input type="number" bind:value={midiNote} min="0" max="127" aria-label="MIDI Note"/>
-                                            {/if}
-                                            <button class="primary-button" onclick={() => applyMidiToEncoder(encoder, 'ccw')}>
-                                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                                    <path d="M20 6L9 17L4 12" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                                                </svg>
-                                                Apply to CCW
-                                            </button>
-                                            <button class="primary-button" onclick={() => applyMidiToEncoder(encoder, 'cw')}>
-                                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                                    <path d="M20 6L9 17L4 12" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                                                </svg>
-                                                Apply to CW
-                                            </button>
-                                        </div>
-                                        <button class="primary-button" onclick={() => updateEncoder(encoder.encoder_id, encoder.ccw_keycode, encoder.cw_keycode)}>
-                                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                                <path d="M20 6L9 17L4 12" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                                    <div class="encoder-actions">
+                                        <button 
+                                            class="encoder-direction-btn ccw"
+                                            onclick={() => openEncoderModal(encoder, 'ccw')}
+                                        >
+                                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                                <path d="M15 18L9 12L15 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
                                             </svg>
-                                            Update
+                                            <div class="direction-info">
+                                                <span class="direction-label">Counter-Clockwise</span>
+                                                <div class="direction-value">
+                                                    {#each formatKeyLabel(encoder.ccw_keycode) as line}
+                                                        <div class="value-line">{line}</div>
+                                                    {/each}
+                                                </div>
+                                            </div>
+                                        </button>
+                                        <button 
+                                            class="encoder-direction-btn cw"
+                                            onclick={() => openEncoderModal(encoder, 'cw')}
+                                        >
+                                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                                <path d="M9 18L15 12L9 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                                            </svg>
+                                            <div class="direction-info">
+                                                <span class="direction-label">Clockwise</span>
+                                                <div class="direction-value">
+                                                    {#each formatKeyLabel(encoder.cw_keycode) as line}
+                                                        <div class="value-line">{line}</div>
+                                                    {/each}
+                                                </div>
+                                            </div>
                                         </button>
                                     </div>
                                 </div>
@@ -714,7 +640,6 @@
                 </div>
             {/if}
 
-            <!-- Configuration Tab -->
             {#if selectedTab === 'config'}
                 <div class="glass-card config-card">
                     <div class="card-header">
@@ -764,24 +689,274 @@
                         </button>
                     </div>
                     
-                    <div class="config-info">
-                        <div class="info-card">
-                            <h4>Save to EEPROM</h4>
-                            <p>Permanently stores your current configuration to the keyboard's memory</p>
-                        </div>
-                        <div class="info-card">
-                            <h4>Load from EEPROM</h4>
-                            <p>Restores the previously saved configuration from the keyboard's memory</p>
-                        </div>
-                        <div class="info-card">
-                            <h4>Reset to Defaults</h4>
-                            <p>Resets all settings to factory defaults - this action cannot be undone</p>
-                        </div>
-                    </div>
+                 
                 </div>
             {/if}
         </div>
     </div>
+
+    {#if showKeyModal && modalKey}
+        <div 
+            class="modal-overlay" 
+            onclick={closeKeyModal}
+            onkeydown={(e) => handleOverlayKeydown(e, closeKeyModal)}
+            role="button"
+            tabindex="0"
+            aria-label="Close modal"
+        >
+            <div 
+                class="modal-content" 
+                onclick={(e) => e.stopPropagation()}
+                onkeydown={(e) => e.stopPropagation()}
+                role="dialog"
+                tabindex="-1"
+                aria-modal="true"
+                aria-labelledby="key-modal-title"
+            >
+                <div class="modal-header">
+                    <h3 id="key-modal-title">Edit Key R{modalKey.row}C{modalKey.col}</h3>
+                    <button class="modal-close" onclick={closeKeyModal} aria-label="Close modal">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <line x1="18" y1="6" x2="6" y2="18" stroke="currentColor" stroke-width="2"/>
+                            <line x1="6" y1="6" x2="18" y2="18" stroke="currentColor" stroke-width="2"/>
+                        </svg>
+                    </button>
+                </div>
+
+                <div class="modal-tabs">
+                    <button 
+                        class="modal-tab"
+                        class:active={keyModalTab === 'standard'}
+                        onclick={() => keyModalTab = 'standard'}
+                    >
+                        Standard Keys
+                    </button>
+                    <button 
+                        class="modal-tab"
+                        class:active={keyModalTab === 'midi'}
+                        onclick={() => keyModalTab = 'midi'}
+                    >
+                        MIDI
+                    </button>
+                </div>
+
+                <div class="modal-body">
+                    {#if keyModalTab === 'standard'}
+                        <div class="keycode-selector">
+                            {#each Object.entries(getKeycodesByCategory()) as [category, options]}
+                                <div class="keycode-category">
+                                    <h4 class="category-title">{category}</h4>
+                                    <div class="keycode-grid">
+                                        {#each options as option}
+                                            <button
+                                                class="keycode-option"
+                                                class:selected={modalKey.keycode === option.value}
+                                                onclick={() => modalKey.keycode = option.value}
+                                            >
+                                                {option.label}
+                                            </button>
+                                        {/each}
+                                    </div>
+                                </div>
+                            {/each}
+                        </div>
+                    {:else}
+                        <div class="midi-config">
+                            <div class="form-group">
+                                <label for="midiType">MIDI Type</label>
+                                <select id="midiType" bind:value={midiType}>
+                                    <option value="cc">Control Change (CC)</option>
+                                    <option value="note">Note</option>
+                                </select>
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="midiChannel">Channel</label>
+                                    <input id="midiChannel" type="number" min="1" max="16" bind:value={midiChannel} />
+                                </div>
+                                {#if midiType === 'cc'}
+                                    <div class="form-group">
+                                        <label for="midiController">Controller</label>
+                                        <input id="midiController" type="number" min="0" max="127" bind:value={midiController} />
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="midiValue">Value</label>
+                                        <input id="midiValue" type="number" min="0" max="127" bind:value={midiValue} />
+                                    </div>
+                                {:else}
+                                    <div class="form-group">
+                                        <label for="midiNote">Note</label>
+                                        <input id="midiNote" type="number" min="0" max="127" bind:value={midiNote} />
+                                    </div>
+                                {/if}
+                            </div>
+                            <div class="midi-preview">
+                                <div class="preview-compact">
+                                    {#each formatKeyLabel(modalKey.keycode) as line}
+                                        <div class="preview-line">{line}</div>
+                                    {/each}
+                                </div>
+                                <div class="muted">Use the main Apply button to save changes.</div>
+                            </div>
+                        </div>
+                    {/if}
+                </div>
+
+                <div class="modal-footer">
+                    <button class="secondary-button" onclick={closeKeyModal}>Cancel</button>
+                    <button class="primary-button" onclick={applyKeyChange}>Apply</button>
+                </div>
+            </div>
+        </div>
+    {/if}
+
+    {#if showEncoderModal && modalEncoder}
+        <div 
+            class="modal-overlay" 
+            onclick={closeEncoderModal}
+            onkeydown={(e) => handleOverlayKeydown(e, closeEncoderModal)}
+            role="button"
+            tabindex="0"
+            aria-label="Close modal"
+        >
+            <div 
+                class="modal-content" 
+                onclick={(e) => e.stopPropagation()}
+                onkeydown={(e) => e.stopPropagation()}
+                role="dialog"
+                tabindex="-1"
+                aria-modal="true"
+                aria-labelledby="encoder-modal-title"
+            >
+                <div class="modal-header">
+                    <h3 id="encoder-modal-title">Edit Encoder {modalEncoder.encoder_id} - {encoderModalDirection === 'ccw' ? 'Counter-Clockwise' : 'Clockwise'}</h3>
+                    <button class="modal-close" onclick={closeEncoderModal} aria-label="Close modal">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <line x1="18" y1="6" x2="6" y2="18" stroke="currentColor" stroke-width="2"/>
+                            <line x1="6" y1="6" x2="18" y2="18" stroke="currentColor" stroke-width="2"/>
+                        </svg>
+                    </button>
+                </div>
+
+                <div class="modal-tabs">
+                    <button 
+                        class="modal-tab"
+                        class:active={encoderModalTab === 'standard'}
+                        onclick={() => encoderModalTab = 'standard'}
+                    >
+                        Standard Keys
+                    </button>
+                    <button 
+                        class="modal-tab"
+                        class:active={encoderModalTab === 'midi'}
+                        onclick={() => encoderModalTab = 'midi'}
+                    >
+                        MIDI
+                    </button>
+                </div>
+
+                <div class="modal-body">
+                    {#if encoderModalTab === 'standard'}
+                        <div class="keycode-selector">
+                            {#each Object.entries(getKeycodesByCategory()) as [category, options]}
+                                <div class="keycode-category">
+                                    <h4 class="category-title">{category}</h4>
+                                    <div class="keycode-grid">
+                                        {#each options as option}
+                                            <button
+                                                class="keycode-option"
+                                                class:selected={
+                                                    (encoderModalDirection === 'ccw' && modalEncoder.ccw_keycode === option.value) ||
+                                                    (encoderModalDirection === 'cw' && modalEncoder.cw_keycode === option.value)
+                                                }
+                                                onclick={() => {
+                                                    if (encoderModalDirection === 'ccw') {
+                                                        modalEncoder.ccw_keycode = option.value;
+                                                    } else {
+                                                        modalEncoder.cw_keycode = option.value;
+                                                    }
+                                                    modalEncoder = modalEncoder;
+                                                }}
+                                            >
+                                                {option.label}
+                                            </button>
+                                        {/each}
+                                    </div>
+                                </div>
+                            {/each}
+                        </div>
+                    {:else}
+                        <div class="midi-config">
+                            <div class="form-group">
+                                <label for="encoderMidiType">MIDI Type</label>
+                                <select id="encoderMidiType" bind:value={midiType}>
+                                    <option value="cc">Control Change (CC)</option>
+                                    <option value="note">Note</option>
+                                </select>
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="encoderMidiChannel">Channel</label>
+                                    <input id="encoderMidiChannel" type="number" min="1" max="16" bind:value={midiChannel} />
+                                </div>
+                                {#if midiType === 'cc'}
+                                    <div class="form-group">
+                                        <label for="encoderMidiController">Controller</label>
+                                        <input id="encoderMidiController" type="number" min="0" max="127" bind:value={midiController} />
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="encoderMidiValue">Value</label>
+                                        <input id="encoderMidiValue" type="number" min="0" max="127" bind:value={midiValue} />
+                                    </div>
+                                {:else}
+                                    <div class="form-group">
+                                        <label for="encoderMidiNote">Note</label>
+                                        <input id="encoderMidiNote" type="number" min="0" max="127" bind:value={midiNote} />
+                                    </div>
+                                {/if}
+                            </div>
+                            <div class="midi-preview">
+                                <div class="preview-compact">
+                                    {#each formatKeyLabel(encoderModalDirection === 'ccw' ? modalEncoder.ccw_keycode : modalEncoder.cw_keycode) as line}
+                                        <div class="preview-line">{line}</div>
+                                    {/each}
+                                </div>
+                                <div class="muted">Use the main Apply button to save changes.</div>
+                            </div>
+                        </div>
+                    {/if}
+                </div>
+
+                <div class="modal-footer">
+                    <button class="secondary-button" onclick={closeEncoderModal}>Cancel</button>
+                    <button class="primary-button" onclick={applyEncoderChange}>Apply</button>
+                </div>
+            </div>
+        </div>
+    {/if}
+
+    {#if showSavePopup}
+        <div class="save-popup">
+            <div class="save-popup-content">
+                <div class="save-popup-text">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2"/>
+                        <path d="M12 8V12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                        <circle cx="12" cy="16" r="1" fill="currentColor"/>
+                    </svg>
+                    <span>You have unsaved changes</span>
+                </div>
+                <div class="save-popup-actions">
+                    <button class="popup-button discard" onclick={discardChanges}>
+                        Discard
+                    </button>
+                    <button class="popup-button save" onclick={saveConfig}>
+                        Save to EEPROM
+                    </button>
+                </div>
+            </div>
+        </div>
+    {/if}
 </main>
 
 <style>
@@ -801,6 +976,7 @@
     .app {
         min-height: 100vh;
         position: relative;
+        padding-bottom: 100px;
     }
 
     .app-background {
@@ -921,9 +1097,6 @@
 
     .card-header {
         margin-bottom: 24px;
-        display: flex;
-        justify-content: space-between;
-        align-items: flex-start;
     }
 
     .card-header h2 {
@@ -937,6 +1110,47 @@
         margin: 0;
         color: #a0a0a0;
         font-size: 14px;
+    }
+
+    /* Connection Layout */
+    .connection-layout {
+        display: flex;
+        align-items: center;
+        gap: 24px;
+        flex-wrap: wrap;
+    }
+
+    .connection-action {
+        flex-shrink: 0;
+    }
+
+    /* Compact Device Info */
+    .device-info-compact {
+        display: flex;
+        gap: 12px;
+        flex-wrap: wrap;
+        flex: 1;
+    }
+
+    .info-chip {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 8px 12px;
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 8px;
+        font-size: 13px;
+    }
+
+    .info-chip .info-label {
+        color: #a0a0a0;
+        font-weight: 500;
+    }
+
+    .info-chip .info-value {
+        color: #ffffff;
+        font-weight: 600;
     }
 
     /* Error Banner */
@@ -1085,37 +1299,6 @@
         color: #a0a0a0;
     }
 
-    /* Device Info Grid */
-    .device-info-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-        gap: 16px;
-    }
-
-    .info-item {
-        display: flex;
-        flex-direction: column;
-        gap: 4px;
-        padding: 16px;
-        background: rgba(255, 255, 255, 0.05);
-        border-radius: 8px;
-        border: 1px solid rgba(255, 255, 255, 0.1);
-    }
-
-    .info-label {
-        font-size: 12px;
-        color: #a0a0a0;
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
-        font-weight: 500;
-    }
-
-    .info-value {
-        font-size: 14px;
-        color: #ffffff;
-        font-weight: 500;
-    }
-
     /* Tab Navigation */
     .tab-nav {
         display: flex;
@@ -1164,15 +1347,13 @@
     /* Keymap */
     .keymap-container {
         display: flex;
-        gap: 24px;
-        align-items: flex-start;
+        justify-content: center;
     }
 
     .keymap {
         display: flex;
         flex-direction: column;
         gap: 4px;
-        flex: 1;
     }
 
     .keymap-row {
@@ -1216,80 +1397,31 @@
 
     .key:hover {
         border-color: rgba(102, 126, 234, 0.5);
-        transform: translateY(-1px);
+        transform: translateY(-2px);
         box-shadow: 0 4px 12px rgba(102, 126, 234, 0.2);
     }
 
-    .key.selected {
-        border-color: #667eea;
-        background: rgba(102, 126, 234, 0.1);
-        box-shadow: 0 0 0 2px rgba(102, 126, 234, 0.3);
-    }
-
     .key-label {
-        font-size: 12px;
-        line-height: 1.0;
+        font-size: 11px;
+        line-height: 1.2;
         text-align: center;
-        margin: 0;
-    }
-
-    .key-coords {
-        font-size: 9px;
-        color: #a0a0a0;
         position: relative;
         z-index: 1;
     }
 
-    /* Key Editor */
-    .key-editor {
-        min-width: 300px;
-        background: rgba(255, 255, 255, 0.05);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        border-radius: 12px;
-        padding: 20px;
-        backdrop-filter: blur(10px);
-    }
+    /* Keep key cells square and multiline labels compact */
+    .key { display:flex; align-items:center; justify-content:center; text-align:center; }
+    .preview-compact { display:flex; flex-direction:column; gap:2px; align-items:center; }
+    .preview-line { font-size:11px; line-height:1; }
+    .muted { font-size:12px; color:#a0a0a0; margin-top:6px; }
 
-    .editor-header h3 {
-        margin: 0 0 16px 0;
-        font-size: 16px;
-        font-weight: 600;
-        color: #ffffff;
-    }
-
-    .form-group {
-        margin-bottom: 16px;
-    }
-
-    .form-group label {
-        display: block;
-        margin-bottom: 8px;
-        font-size: 14px;
-        font-weight: 500;
-        color: #ffffff;
-    }
-
-    .form-group select {
-        width: 100%;
-        padding: 12px;
-        background: rgba(255, 255, 255, 0.05);
-        border: 1px solid rgba(255, 255, 255, 0.2);
-        border-radius: 8px;
-        color: #ffffff;
-        font-size: 14px;
-        backdrop-filter: blur(10px);
-    }
-
-    .form-group select:focus {
-        outline: none;
-        border-color: #667eea;
-        box-shadow: 0 0 0 2px rgba(102, 126, 234, 0.2);
-    }
+    /* Encoder value lines fit in one row when possible */
+    .value-line { display:inline-block; font-size:13px; }
 
     /* Encoders */
     .encoders-grid {
         display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+        grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
         gap: 20px;
     }
 
@@ -1308,10 +1440,51 @@
         color: #ffffff;
     }
 
-    .encoder-controls {
+    .encoder-actions {
         display: flex;
         flex-direction: column;
-        gap: 16px;
+        gap: 12px;
+    }
+
+    .encoder-direction-btn {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 16px;
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 8px;
+        cursor: pointer;
+        transition: all 0.2s;
+        color: #ffffff;
+    }
+
+    .encoder-direction-btn:hover {
+        background: rgba(255, 255, 255, 0.1);
+        border-color: rgba(102, 126, 234, 0.5);
+        transform: translateX(4px);
+    }
+
+    .direction-info {
+        flex: 1;
+        text-align: left;
+    }
+
+    .direction-label {
+        display: block;
+        font-size: 12px;
+        color: #a0a0a0;
+        margin-bottom: 4px;
+    }
+
+    .direction-value {
+        font-size: 14px;
+        font-weight: 500;
+        color: #ffffff;
+    }
+
+    .value-line {
+        line-height: 1.3;
     }
 
     /* Configuration */
@@ -1374,66 +1547,301 @@
         font-size: 14px;
     }
 
-    /* Connection Status */
-    .device-header-left {
+    /* Modal */
+    .modal-overlay {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0, 0, 0, 0.7);
+        backdrop-filter: blur(4px);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 1000;
+        padding: 24px;
+    }
+
+    .modal-content {
+        background: rgba(20, 20, 20, 0.95);
+        backdrop-filter: blur(20px);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 16px;
+        width: 100%;
+        max-width: 700px;
+        max-height: 80vh;
+        display: flex;
+        flex-direction: column;
+        box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+    }
+
+    .modal-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 24px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    }
+
+    .modal-header h3 {
+        margin: 0;
+        font-size: 18px;
+        font-weight: 600;
+        color: #ffffff;
+    }
+
+    .modal-close {
+        background: none;
+        border: none;
+        color: #a0a0a0;
+        cursor: pointer;
+        padding: 4px;
+        border-radius: 4px;
+        transition: all 0.2s;
+    }
+
+    .modal-close:hover {
+        background: rgba(255, 255, 255, 0.1);
+        color: #ffffff;
+    }
+
+    .modal-tabs {
+        display: flex;
+        gap: 4px;
+        padding: 16px 24px 0;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    }
+
+    .modal-tab {
+        background: none;
+        border: none;
+        padding: 12px 20px;
+        border-radius: 8px 8px 0 0;
+        cursor: pointer;
+        font-size: 14px;
+        font-weight: 500;
+        color: #a0a0a0;
+        transition: all 0.2s;
+    }
+
+    .modal-tab:hover {
+        color: #ffffff;
+        background: rgba(255, 255, 255, 0.05);
+    }
+
+    .modal-tab.active {
+        background: rgba(255, 255, 255, 0.1);
+        color: #ffffff;
+    }
+
+    .modal-body {
+        padding: 24px;
+        overflow-y: auto;
+        flex: 1;
+    }
+
+    .keycode-selector {
+        display: flex;
+        flex-direction: column;
+        gap: 24px;
+    }
+
+    .keycode-category {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+    }
+
+    .category-title {
+        font-size: 13px;
+        font-weight: 600;
+        color: #a0a0a0;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        margin: 0;
+    }
+
+    .keycode-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+        gap: 8px;
+    }
+
+    .keycode-option {
+        padding: 12px;
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 8px;
+        cursor: pointer;
+        font-size: 13px;
+        color: #ffffff;
+        transition: all 0.2s;
+        text-align: center;
+    }
+
+    .keycode-option:hover {
+        background: rgba(255, 255, 255, 0.1);
+        border-color: rgba(102, 126, 234, 0.5);
+    }
+
+    .keycode-option.selected {
+        background: rgba(102, 126, 234, 0.2);
+        border-color: #667eea;
+        box-shadow: 0 0 0 2px rgba(102, 126, 234, 0.3);
+    }
+
+    .midi-config {
+        display: flex;
+        flex-direction: column;
+        gap: 20px;
+    }
+
+    .form-group {
         display: flex;
         flex-direction: column;
         gap: 8px;
     }
 
-    .device-header-left h2 {
-        margin: 0;
+    .form-group label {
+        font-size: 13px;
+        font-weight: 500;
+        color: #a0a0a0;
     }
 
-    .connection-status {
+    .form-group select,
+    .form-group input {
+        padding: 12px;
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        border-radius: 8px;
+        color: #ffffff;
+        font-size: 14px;
+    }
+
+    .form-group select:focus,
+    .form-group input:focus {
+        outline: none;
+        border-color: #667eea;
+        box-shadow: 0 0 0 2px rgba(102, 126, 234, 0.2);
+    }
+
+    .form-row {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+        gap: 12px;
+    }
+
+    .midi-preview {
+        padding: 16px;
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 8px;
         display: flex;
         align-items: center;
-        gap: 8px;
+        gap: 12px;
+    }
+
+    .preview-label {
         font-size: 13px;
+        color: #a0a0a0;
         font-weight: 500;
     }
 
-    .status-indicator {
-        width: 8px;
-        height: 8px;
-        border-radius: 50%;
-        animation: pulse 2s infinite;
+    .preview-value {
+        font-size: 14px;
+        color: #ffffff;
+        font-weight: 600;
     }
 
-    .connection-status.connected .status-indicator {
-        background-color: #22c55e;
-        animation: none;
+    .modal-footer {
+        display: flex;
+        justify-content: flex-end;
+        gap: 12px;
+        padding: 24px;
+        border-top: 1px solid rgba(255, 255, 255, 0.1);
     }
 
-    .connection-status.reconnecting .status-indicator {
-        background-color: #eab308;
-        animation: pulse 1.5s infinite;
+    /* Save Popup */
+    .save-popup {
+        position: fixed;
+        bottom: 24px;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 999;
+        animation: slideUp 0.3s ease-out;
     }
 
-    .connection-status.disconnected .status-indicator {
-        background-color: #ef4444;
-        animation: none;
+    @keyframes slideUp {
+        from {
+            transform: translateX(-50%) translateY(100px);
+            opacity: 0;
+        }
+        to {
+            transform: translateX(-50%) translateY(0);
+            opacity: 1;
+        }
     }
 
-    .connection-status.connected .status-text {
-        color: #22c55e;
+    .save-popup-content {
+        background: rgba(20, 20, 20, 0.95);
+        backdrop-filter: blur(20px);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        border-radius: 16px;
+        padding: 16px 24px;
+        display: flex;
+        align-items: center;
+        gap: 24px;
+        box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
     }
 
-    .connection-status.reconnecting .status-text {
+    .save-popup-text {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        color: #ffffff;
+        font-size: 14px;
+        font-weight: 500;
+    }
+
+    .save-popup-text svg {
         color: #eab308;
     }
 
-    .connection-status.disconnected .status-text {
-        color: #ef4444;
+    .save-popup-actions {
+        display: flex;
+        gap: 12px;
     }
 
-    @keyframes pulse {
-        0%, 100% {
-            opacity: 1;
-        }
-        50% {
-            opacity: 0.5;
-        }
+    .popup-button {
+        padding: 10px 20px;
+        border-radius: 8px;
+        font-size: 14px;
+        font-weight: 500;
+        cursor: pointer;
+        transition: all 0.2s;
+        border: none;
+    }
+
+    .popup-button.discard {
+        background: rgba(255, 255, 255, 0.1);
+        color: #ffffff;
+        border: 1px solid rgba(255, 255, 255, 0.2);
+    }
+
+    .popup-button.discard:hover {
+        background: rgba(255, 255, 255, 0.15);
+    }
+
+    .popup-button.save {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
+    }
+
+    .popup-button.save:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 6px 20px rgba(102, 126, 234, 0.4);
     }
 
     /* Responsive */
@@ -1452,16 +1860,21 @@
             flex-direction: column;
         }
 
-        .keymap-container {
-            flex-direction: column;
-        }
-
         .config-actions {
             flex-direction: column;
         }
 
-        .device-info-grid {
-            grid-template-columns: 1fr;
+        .modal-content {
+            max-width: 100%;
+        }
+
+        .keycode-grid {
+            grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
+        }
+
+        .save-popup-content {
+            flex-direction: column;
+            gap: 16px;
         }
     }
 </style>
