@@ -23,6 +23,10 @@ pub enum ConfigCommand {
     SetI2CConfig = 0x0A,
     GetDeviceStatus = 0x0B,
     Reboot = 0x0C,
+    // Slave device commands
+    GetSlaveKeymap = 0x11,
+    SetSlaveKeymap = 0x12,
+    GetSlaveInfo = 0x13,
 }
                          
 impl From<u8> for ConfigCommand {
@@ -40,6 +44,9 @@ impl From<u8> for ConfigCommand {
             0x0A => ConfigCommand::SetI2CConfig,
             0x0B => ConfigCommand::GetDeviceStatus,
             0x0C => ConfigCommand::Reboot,
+            0x11 => ConfigCommand::GetSlaveKeymap,
+            0x12 => ConfigCommand::SetSlaveKeymap,
+            0x13 => ConfigCommand::GetSlaveInfo,
             _ => ConfigCommand::GetInfo, // Default fallback
         }
     }
@@ -189,6 +196,15 @@ pub struct KeymapEntry {
     pub keycode: u16,
 }
 
+/// Slave keymap entry structure (matches firmware)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlaveKeymapEntry {
+    pub slave_addr: u8,
+    pub row: u8,
+    pub col: u8,
+    pub keycode: u16,
+}
+
 impl KeymapEntry {
     pub fn from_payload(payload: &[u8]) -> Result<Self, String> {
         if payload.len() < 4 {
@@ -201,7 +217,33 @@ impl KeymapEntry {
             keycode: u16::from_le_bytes([payload[2], payload[3]]),
         })
     }
+}
 
+impl SlaveKeymapEntry {
+    pub fn from_payload(payload: &[u8]) -> Result<Self, String> {
+        if payload.len() < 5 {
+            return Err("Slave keymap entry payload too short".to_string());
+        }
+
+        Ok(SlaveKeymapEntry {
+            slave_addr: payload[0],
+            row: payload[1],
+            col: payload[2],
+            keycode: u16::from_le_bytes([payload[3], payload[4]]),
+        })
+    }
+    
+    pub fn to_payload(&self) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.push(self.slave_addr);
+        payload.push(self.row);
+        payload.push(self.col);
+        payload.extend_from_slice(&self.keycode.to_le_bytes());
+        payload
+    }
+}
+
+impl KeymapEntry {
     pub fn to_payload(&self) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.push(self.row);
@@ -257,6 +299,36 @@ pub struct I2CDeviceInfo {
 }
 
 impl I2CDeviceInfo {
+    pub fn from_payload_at_index(payload: &[u8], index: usize) -> Result<Self, String> {
+        // Each I2C device entry is 16 bytes
+        let offset = index * 16;
+        if payload.len() < offset + 16 {
+            return Err("I2C device info payload too short".to_string());
+        }
+
+        // Extract device name (null-terminated string)
+        let name_bytes = &payload[offset + 5..offset + 10];
+        let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(5);
+        let name = String::from_utf8_lossy(&name_bytes[..name_end]).to_string();
+
+        Ok(I2CDeviceInfo {
+            address: payload[offset],
+            status: payload[offset + 1],
+            firmware_version_major: payload[offset + 2],
+            firmware_version_minor: payload[offset + 3],
+            firmware_version_patch: payload[offset + 4],
+            name,
+            reserved: [
+                payload[offset + 10],
+                payload[offset + 11],
+                payload[offset + 12],
+                payload[offset + 13],
+                payload[offset + 14],
+                payload[offset + 15],
+            ],
+        })
+    }
+    
     pub fn from_payload(payload: &[u8]) -> Result<Self, String> {
         if payload.len() < 27 {
             return Err("I2C device info payload too short".to_string());

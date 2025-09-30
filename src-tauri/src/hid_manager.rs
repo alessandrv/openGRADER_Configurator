@@ -547,6 +547,89 @@ impl HidManager {
 
         Ok(())
     }
+    
+    /// Get keymap entry from a specific slave device
+    pub async fn get_slave_keymap_entry(
+        &self,
+        slave_addr: u8,
+        row: u8,
+        col: u8,
+    ) -> Result<SlaveKeymapEntry, String> {
+        // Handle mock device
+        if *self.is_mock_device.lock().unwrap() {
+            // Return mock slave keymap data
+            let keycode = match (row, col) {
+                (0, 0) => 0x04, // KC_A
+                (0, 1) => 0x05, // KC_B
+                _ => 0x00, // KC_NO
+            };
+            
+            return Ok(SlaveKeymapEntry {
+                slave_addr,
+                row,
+                col,
+                keycode,
+            });
+        }
+        
+        let payload = [slave_addr, row, col];
+        let response = self.send_command(ConfigCommand::GetSlaveKeymap, &payload).await?;
+        
+        let status = StatusCode::from(response.status);
+        if !matches!(status, StatusCode::Ok) {
+            return Err(format!("Device returned error: {:?}", status));
+        }
+
+        SlaveKeymapEntry::from_payload(&response.payload[..response.payload_length as usize])
+    }
+
+    /// Set keymap entry on a specific slave device
+    pub async fn set_slave_keymap_entry(&self, entry: &SlaveKeymapEntry) -> Result<(), String> {
+        // Handle mock device
+        if *self.is_mock_device.lock().unwrap() {
+            // For mock device, just pretend to set the slave keymap
+            return Ok(());
+        }
+        
+        let payload = entry.to_payload();
+        let response = self.send_command(ConfigCommand::SetSlaveKeymap, &payload).await?;
+        
+        let status = StatusCode::from(response.status);
+        if !matches!(status, StatusCode::Ok) {
+            return Err(format!("Device returned error: {:?}", status));
+        }
+
+        Ok(())
+    }
+    
+    /// Get device info from a specific slave device
+    pub async fn get_slave_info(&self, slave_addr: u8) -> Result<DeviceInfo, String> {
+        // Handle mock device
+        if *self.is_mock_device.lock().unwrap() {
+            return Ok(DeviceInfo {
+                device_name: format!("Mock Slave {}", slave_addr),
+                protocol_version: 1,
+                firmware_version_major: 1,
+                firmware_version_minor: 0,
+                firmware_version_patch: 0,
+                device_type: 2, // Slave
+                matrix_rows: 2,
+                matrix_cols: 2,
+                encoder_count: 0,
+                i2c_devices: 0,
+            });
+        }
+        
+        let payload = [slave_addr];
+        let response = self.send_command(ConfigCommand::GetSlaveInfo, &payload).await?;
+        
+        let status = StatusCode::from(response.status);
+        if !matches!(status, StatusCode::Ok) {
+            return Err(format!("Device returned error: {:?}", status));
+        }
+
+        DeviceInfo::from_payload(&response.payload[..response.payload_length as usize])
+    }
 
     /// Get encoder mapping
     pub async fn get_encoder_entry(&self, encoder_id: u8) -> Result<EncoderEntry, String> {
@@ -639,14 +722,26 @@ impl HidManager {
     /// Get I2C devices
     pub async fn get_i2c_devices(&self) -> Result<Vec<I2CDeviceInfo>, String> {
         let response = self.send_command(ConfigCommand::GetI2CDevices, &[]).await?;
+        println!("DEBUG: Raw response payload: {:?}", response.payload);
         
         let status = StatusCode::from(response.status);
         if !matches!(status, StatusCode::Ok) {
             return Err(format!("Device returned error: {:?}", status));
         }
 
-        // Parse multiple I2C devices from payload (not yet implemented in firmware)
-        Ok(vec![]) // Placeholder
+        let mut i2c_devices = Vec::new();
+        let payload_len = response.payload_length as usize;
+        let mut offset = 0;
+
+        while offset + 16 <= payload_len {
+            match I2CDeviceInfo::from_payload_at_index(&response.payload, offset / 16) {
+                Ok(device_info) => i2c_devices.push(device_info),
+                Err(e) => return Err(format!("Failed to parse I2C device info: {}", e)),
+            }
+            offset += 16;
+        }
+        
+        Ok(i2c_devices)
     }
 
     /// Reboot device

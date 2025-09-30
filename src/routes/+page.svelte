@@ -13,8 +13,14 @@
     let loadingKeymap = $state(false);
     let loadingEncoders = $state(false);
     
+    // I2C slave devices
+    let i2cDevices = $state([]);
+    let loadingI2CDevices = $state(false);
+    let selectedDevice = $state('main'); // 'main' or slave address
+    
     // Keymap and encoder data
     let keymap = $state([]);
+    let slaveKeymaps = $state({}); // Map of slave address -> keymap
     let encoders = $state([]);
     let keycodes = {};
     
@@ -81,6 +87,30 @@
             encoders = result.encoders || [];
             dataLoaded = true;
             
+            // Load I2C devices and their keymaps
+            loadingI2CDevices = true;
+            try {
+                i2cDevices = await invoke('get_i2c_devices');
+                console.log('I2C devices loaded:', i2cDevices);
+                
+                // Load slave keymaps for connected devices
+                for (const device of i2cDevices) {
+                    if (device.status === 1) { // Connected
+                        try {
+                            const slaveKeymap = await invoke('get_full_slave_keymap', { slaveAddr: device.address });
+                            slaveKeymaps[device.address] = slaveKeymap;
+                            console.log(`Loaded keymap for slave device ${device.address}`);
+                        } catch (e) {
+                            console.error(`Failed to load keymap for slave device ${device.address}:`, e);
+                        }
+                    }
+                }
+            } catch (e) {
+                console.error('Failed to load I2C devices:', e);
+            } finally {
+                loadingI2CDevices = false;
+            }
+            
             storeOriginalData();
             
             console.log('Connected successfully:', result);
@@ -93,6 +123,8 @@
             deviceInfo = null;
             keymap = [];
             encoders = [];
+            i2cDevices = [];
+            slaveKeymaps = {};
             dataLoaded = false;
         }
         
@@ -132,15 +164,46 @@
     // Keymap functions
     async function updateKeymap(row, col, keycode) {
         try {
-            await invoke('set_keymap_entry', {
-                entry: { row, col, keycode }
-            });
+            if (selectedDevice === 'main') {
+                await invoke('set_keymap_entry', {
+                    entry: { row, col, keycode }
+                });
+                
+                keymap[row][col].keycode = keycode;
+                keymap = keymap;
+            } else {
+                // Update slave device keymap
+                const slaveAddr = parseInt(selectedDevice);
+                await invoke('set_slave_keymap_entry', {
+                    entry: { slave_addr: slaveAddr, row, col, keycode }
+                });
+                
+                if (!slaveKeymaps[slaveAddr]) {
+                    slaveKeymaps[slaveAddr] = [];
+                }
+                
+                if (!slaveKeymaps[slaveAddr][row]) {
+                    slaveKeymaps[slaveAddr][row] = [];
+                }
+                
+                slaveKeymaps[slaveAddr][row][col] = { row, col, keycode };
+                slaveKeymaps = {...slaveKeymaps}; // trigger reactivity
+            }
             
-            keymap[row][col].keycode = keycode;
-            keymap = keymap;
             checkForChanges();
         } catch (e) {
             error = `Failed to update keymap: ${e}`;
+            console.error('Failed to update keymap:', e);
+        }
+    }
+    
+    // Get the current active keymap based on selected device
+    function getCurrentKeymap() {
+        if (selectedDevice === 'main') {
+            return keymap;
+        } else {
+            const slaveAddr = parseInt(selectedDevice);
+            return slaveKeymaps[slaveAddr] || [];
         }
     }
 
@@ -520,6 +583,26 @@
            
         </nav>
 
+        {#if isConnected}
+            <div class="device-selector-container">
+                <label for="device-selector">Select Device:</label>
+                <select 
+                    id="device-selector" 
+                    bind:value={selectedDevice}
+                    class="device-selector"
+                >
+                    <option value="main">Main Device ({deviceInfo?.device_name || 'Unknown'})</option>
+                    {#each i2cDevices as device}
+                        {#if device.status === 1} <!-- Only show connected devices -->
+                            <option value={device.address}>
+                                Slave: {device.name || `Device at 0x${device.address.toString(16)}`}
+                            </option>
+                        {/if}
+                    {/each}
+                </select>
+            </div>
+        {/if}
+
         <div class="tab-content">
             {#if selectedTab === 'keymap'}
                 <div class="glass-card keymap-card">
@@ -528,17 +611,17 @@
                         <p>Click on any key to customize its function</p>
                     </div>
                     
-                    {#if loadingKeymap}
+                    {#if loadingKeymap || (selectedDevice !== 'main' && loadingI2CDevices)}
                         <div class="loading-state">
                             <div class="spinner-large"></div>
                             <h3>Loading Keymap...</h3>
                             <p>Fetching key configuration from device</p>
                         </div>
-                    {:else if keymap.length > 0}
+                    {:else if (selectedDevice === 'main' && keymap.length > 0) || (selectedDevice !== 'main' && slaveKeymaps[selectedDevice] && slaveKeymaps[selectedDevice].length > 0)}
                         <!-- keys open modal -->
                         <div class="keymap-container">
                             <div class="keymap">
-                                {#each keymap as row, rowIndex}
+                                {#each getCurrentKeymap() as row, rowIndex}
                                     <div class="keymap-row">
                                         {#each row as key, colIndex}
                                             <button 

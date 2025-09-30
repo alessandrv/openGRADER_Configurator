@@ -1,5 +1,5 @@
 use crate::hid_manager::{HidManager, DeviceDescriptor};
-use crate::protocol::{DeviceInfo, KeymapEntry, EncoderEntry, I2CDeviceInfo};
+use crate::protocol::{DeviceInfo, KeymapEntry, EncoderEntry, I2CDeviceInfo, SlaveKeymapEntry};
 use std::sync::Arc;
 use tauri::{AppHandle, State, Emitter};
 use tokio::sync::RwLock;
@@ -103,8 +103,6 @@ pub async fn auto_connect(state: State<'_, AppState>, app: AppHandle) -> Result<
 
     if let Ok(true) = ok {
         println!("auto_connect: connection successful, verifying device...");
-        if let Ok(true) = ok {
-        println!("auto_connect: connection successful, verifying device...");
         // Verify device responds to GetInfo before emitting event
         for attempt in 0..3 {
             println!("auto_connect: verification attempt {} of 3", attempt + 1);
@@ -135,7 +133,6 @@ pub async fn auto_connect(state: State<'_, AppState>, app: AppHandle) -> Result<
         }
     } else {
         println!("auto_connect: initial connection failed: {:?}", ok);
-    }
     }
     Ok(false)
 }
@@ -522,13 +519,98 @@ pub async fn reset_config(state: State<'_, AppState>) -> Result<(), String> {
     manager.reset_config().await
 }
 
-// I2C device management commands
+// Slave device keymap commands
 
 #[tauri::command]
-pub async fn get_i2c_devices(state: State<'_, AppState>) -> Result<Vec<I2CDeviceInfo>, String> {
+pub async fn get_slave_keymap_entry(
+    slave_addr: u8,
+    row: u8,
+    col: u8,
+    state: State<'_, AppState>,
+) -> Result<SlaveKeymapEntry, String> {
+    let manager = state.read().await;
+    manager.get_slave_keymap_entry(slave_addr, row, col).await
+}
+
+#[tauri::command]
+pub async fn set_slave_keymap_entry(
+    entry: SlaveKeymapEntry,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let manager = state.read().await;
+    manager.set_slave_keymap_entry(&entry).await
+}
+
+#[tauri::command]
+pub async fn get_slave_info(
+    slave_addr: u8,
+    state: State<'_, AppState>,
+) -> Result<DeviceInfo, String> {
+    let manager = state.read().await;
+    manager.get_slave_info(slave_addr).await
+}
+
+#[tauri::command]
+pub async fn get_i2c_devices(
+    state: State<'_, AppState>,
+) -> Result<Vec<I2CDeviceInfo>, String> {
     let manager = state.read().await;
     manager.get_i2c_devices().await
 }
+
+#[tauri::command]
+pub async fn get_full_slave_keymap(
+    slave_addr: u8,
+    state: State<'_, AppState>,
+) -> Result<Vec<Vec<SlaveKeymapEntry>>, String> {
+    let manager = state.read().await;
+    
+    // Get slave device info first to know matrix dimensions
+    let device_info = manager.get_slave_info(slave_addr).await?;
+    
+    let mut keymap = Vec::new();
+    
+    for row in 0..device_info.matrix_rows {
+        let mut row_entries = Vec::new();
+        
+        for col in 0..device_info.matrix_cols {
+            match manager.get_slave_keymap_entry(slave_addr, row, col).await {
+                Ok(entry) => row_entries.push(entry),
+                Err(_e) => {
+                    // If we can't read a key, create a placeholder
+                    row_entries.push(SlaveKeymapEntry {
+                        slave_addr,
+                        row,
+                        col,
+                        keycode: 0, // KC_NO
+                    });
+                }
+            }
+        }
+        
+        keymap.push(row_entries);
+    }
+    
+    Ok(keymap)
+}
+
+#[tauri::command]
+pub async fn set_full_slave_keymap(
+    keymap: Vec<Vec<SlaveKeymapEntry>>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let manager = state.read().await;
+    
+    for row_entries in keymap {
+        for entry in row_entries {
+            manager.set_slave_keymap_entry(&entry).await?;
+        }
+    }
+    
+    Ok(())
+}
+
+// I2C device management commands
 
 // System commands
 
@@ -536,4 +618,12 @@ pub async fn get_i2c_devices(state: State<'_, AppState>) -> Result<Vec<I2CDevice
 pub async fn reboot_device(state: State<'_, AppState>) -> Result<(), String> {
     let manager = state.read().await;
     manager.reboot_device().await
+}
+
+// Utility commands
+
+#[tauri::command]
+pub fn get_keycodes() -> Result<Vec<crate::keycodes::Keycode>, String> {
+    let keymap = crate::keycodes::get_keycodes();
+    Ok(keymap.into_values().collect())
 }

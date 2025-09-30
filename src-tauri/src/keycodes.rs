@@ -137,7 +137,7 @@ pub fn describe_op_midi(code: u16) -> Option<String> {
     Some(format!("MIDI CC ch{} ctrl{} val{}", channel, controller, val))
 }
 
-#[tauri::command]
+// Function without tauri::command decorator to avoid duplicate
 pub fn get_keycodes() -> HashMap<u16, Keycode> {
     get_keycode_map()
 }
