@@ -68,6 +68,17 @@ pub fn run() {
             // I2C device management
             get_i2c_devices,
             
+            // Slave device management
+            get_slave_keymap_entry,
+            set_slave_keymap_entry,
+            get_slave_info,
+            get_full_slave_keymap,
+            set_full_slave_keymap,
+            get_slave_encoder_entry,
+            set_slave_encoder_entry,
+            get_full_slave_encoders,
+            set_full_slave_encoders,
+            
             // System commands
             reboot_device,
             

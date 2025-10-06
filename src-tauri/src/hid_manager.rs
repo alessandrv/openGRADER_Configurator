@@ -580,7 +580,7 @@ impl HidManager {
             return Err(format!("Device returned error: {:?}", status));
         }
 
-        SlaveKeymapEntry::from_payload(&response.payload[..response.payload_length as usize])
+        SlaveKeymapEntry::from_payload(slave_addr, &response.payload[..response.payload_length as usize])
     }
 
     /// Set keymap entry on a specific slave device
@@ -594,6 +594,50 @@ impl HidManager {
         let payload = entry.to_payload();
         let response = self.send_command(ConfigCommand::SetSlaveKeymap, &payload).await?;
         
+        let status = StatusCode::from(response.status);
+        if !matches!(status, StatusCode::Ok) {
+            return Err(format!("Device returned error: {:?}", status));
+        }
+
+        Ok(())
+    }
+
+    /// Get encoder mapping from a specific slave device
+    pub async fn get_slave_encoder_entry(
+        &self,
+        slave_addr: u8,
+        encoder_id: u8,
+    ) -> Result<SlaveEncoderEntry, String> {
+        if *self.is_mock_device.lock().unwrap() {
+            return Ok(SlaveEncoderEntry {
+                slave_addr,
+                encoder_id,
+                ccw_keycode: 0x52,
+                cw_keycode: 0x51,
+                reserved: 0,
+            });
+        }
+
+        let payload = [slave_addr, encoder_id];
+        let response = self.send_command(ConfigCommand::GetSlaveEncoder, &payload).await?;
+
+        let status = StatusCode::from(response.status);
+        if !matches!(status, StatusCode::Ok) {
+            return Err(format!("Device returned error: {:?}", status));
+        }
+
+        SlaveEncoderEntry::from_payload(slave_addr, &response.payload[..response.payload_length as usize])
+    }
+
+    /// Set encoder mapping on a specific slave device
+    pub async fn set_slave_encoder_entry(&self, entry: &SlaveEncoderEntry) -> Result<(), String> {
+        if *self.is_mock_device.lock().unwrap() {
+            return Ok(());
+        }
+
+        let payload = entry.to_payload();
+        let response = self.send_command(ConfigCommand::SetSlaveEncoder, &payload).await?;
+
         let status = StatusCode::from(response.status);
         if !matches!(status, StatusCode::Ok) {
             return Err(format!("Device returned error: {:?}", status));
@@ -722,23 +766,46 @@ impl HidManager {
     /// Get I2C devices
     pub async fn get_i2c_devices(&self) -> Result<Vec<I2CDeviceInfo>, String> {
         let response = self.send_command(ConfigCommand::GetI2CDevices, &[]).await?;
-        println!("DEBUG: Raw response payload: {:?}", response.payload);
+        println!("DEBUG: Raw response payload length: {}", response.payload_length);
+        println!("DEBUG: First 32 bytes: {:02X?}", &response.payload[..32.min(response.payload_length as usize)]);
         
         let status = StatusCode::from(response.status);
         if !matches!(status, StatusCode::Ok) {
             return Err(format!("Device returned error: {:?}", status));
         }
 
-        let mut i2c_devices = Vec::new();
-        let payload_len = response.payload_length as usize;
-        let mut offset = 0;
+        if response.payload_length < 1 {
+            return Ok(Vec::new()); // No devices
+        }
 
-        while offset + 16 <= payload_len {
-            match I2CDeviceInfo::from_payload_at_index(&response.payload, offset / 16) {
-                Ok(device_info) => i2c_devices.push(device_info),
-                Err(e) => return Err(format!("Failed to parse I2C device info: {}", e)),
+        // First byte is the device count (from firmware)
+        let device_count = response.payload[0] as usize;
+        println!("DEBUG: Device count from firmware: {}", device_count);
+        
+        let mut i2c_devices = Vec::new();
+        
+        // Each device entry is 28 bytes, starting at offset 1
+        // Firmware format: payload[0] = count, then device entries at payload[1..]
+        let device_data_start = 1;
+        
+        for i in 0..device_count {
+            let device_offset = device_data_start + (i * 28);
+            if device_offset + 28 <= response.payload_length as usize {
+                // Extract device info starting from the correct offset
+                let device_slice = &response.payload[device_offset..];
+                match I2CDeviceInfo::from_payload_at_index(device_slice, 0) {
+                    Ok(device_info) => {
+                        println!("DEBUG: Parsed device {}: addr=0x{:02X}, name={}", i, device_info.address, device_info.name);
+                        i2c_devices.push(device_info);
+                    },
+                    Err(e) => {
+                        println!("WARN: Failed to parse device {}: {}", i, e);
+                    }
+                }
+            } else {
+                println!("WARN: Payload too short for device {}", i);
+                break;
             }
-            offset += 16;
         }
         
         Ok(i2c_devices)

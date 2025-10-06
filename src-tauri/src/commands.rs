@@ -1,5 +1,5 @@
 use crate::hid_manager::{HidManager, DeviceDescriptor};
-use crate::protocol::{DeviceInfo, KeymapEntry, EncoderEntry, I2CDeviceInfo, SlaveKeymapEntry};
+use crate::protocol::{DeviceInfo, KeymapEntry, EncoderEntry, I2CDeviceInfo, SlaveKeymapEntry, SlaveEncoderEntry};
 use std::sync::Arc;
 use tauri::{AppHandle, State, Emitter};
 use tokio::sync::RwLock;
@@ -541,6 +541,27 @@ pub async fn set_slave_keymap_entry(
     manager.set_slave_keymap_entry(&entry).await
 }
 
+// Slave device encoder commands
+
+#[tauri::command]
+pub async fn get_slave_encoder_entry(
+    slave_addr: u8,
+    encoder_id: u8,
+    state: State<'_, AppState>,
+) -> Result<SlaveEncoderEntry, String> {
+    let manager = state.read().await;
+    manager.get_slave_encoder_entry(slave_addr, encoder_id).await
+}
+
+#[tauri::command]
+pub async fn set_slave_encoder_entry(
+    entry: SlaveEncoderEntry,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let manager = state.read().await;
+    manager.set_slave_encoder_entry(&entry).await
+}
+
 #[tauri::command]
 pub async fn get_slave_info(
     slave_addr: u8,
@@ -595,6 +616,32 @@ pub async fn get_full_slave_keymap(
 }
 
 #[tauri::command]
+pub async fn get_full_slave_encoders(
+    slave_addr: u8,
+    state: State<'_, AppState>,
+) -> Result<Vec<SlaveEncoderEntry>, String> {
+    let manager = state.read().await;
+
+    let device_info = manager.get_slave_info(slave_addr).await?;
+    let mut encoders = Vec::new();
+
+    for encoder_id in 0..device_info.encoder_count {
+        match manager.get_slave_encoder_entry(slave_addr, encoder_id).await {
+            Ok(entry) => encoders.push(entry),
+            Err(_) => encoders.push(SlaveEncoderEntry {
+                slave_addr,
+                encoder_id,
+                ccw_keycode: 0,
+                cw_keycode: 0,
+                reserved: 0,
+            }),
+        }
+    }
+
+    Ok(encoders)
+}
+
+#[tauri::command]
 pub async fn set_full_slave_keymap(
     keymap: Vec<Vec<SlaveKeymapEntry>>,
     state: State<'_, AppState>,
@@ -626,4 +673,18 @@ pub async fn reboot_device(state: State<'_, AppState>) -> Result<(), String> {
 pub fn get_keycodes() -> Result<Vec<crate::keycodes::Keycode>, String> {
     let keymap = crate::keycodes::get_keycodes();
     Ok(keymap.into_values().collect())
+}
+
+#[tauri::command]
+pub async fn set_full_slave_encoders(
+    encoders: Vec<SlaveEncoderEntry>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let manager = state.read().await;
+
+    for entry in encoders {
+        manager.set_slave_encoder_entry(&entry).await?;
+    }
+
+    Ok(())
 }

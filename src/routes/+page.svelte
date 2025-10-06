@@ -21,6 +21,7 @@
     // Keymap and encoder data
     let keymap = $state([]);
     let slaveKeymaps = $state({}); // Map of slave address -> keymap
+    let slaveEncoders = $state({}); // Map of slave address -> encoders
     let encoders = $state([]);
     let keycodes = {};
     
@@ -30,6 +31,8 @@
     let selectedEncoder = null;
     let originalKeymap = [];
     let originalEncoders = [];
+    let originalSlaveKeymaps = {};
+    let originalSlaveEncoders = {};
     let hasChanges = $state(false);
     let showSavePopup = $state(false);
     let connectionStatus = $state('disconnected');
@@ -58,9 +61,17 @@
         }
     }
 
+    function setSelectedDevice(deviceId) {
+        if (selectedDevice !== deviceId) {
+            selectedDevice = deviceId;
+        }
+    }
+
     function storeOriginalData() {
         originalKeymap = JSON.parse(JSON.stringify(keymap));
         originalEncoders = JSON.parse(JSON.stringify(encoders));
+        originalSlaveKeymaps = JSON.parse(JSON.stringify(slaveKeymaps));
+        originalSlaveEncoders = JSON.parse(JSON.stringify(slaveEncoders));
         hasChanges = false;
         showSavePopup = false;
     }
@@ -68,7 +79,9 @@
     function checkForChanges() {
         const keymapChanged = JSON.stringify(keymap) !== JSON.stringify(originalKeymap);
         const encodersChanged = JSON.stringify(encoders) !== JSON.stringify(originalEncoders);
-        hasChanges = keymapChanged || encodersChanged;
+        const slaveKeymapsChanged = JSON.stringify(slaveKeymaps) !== JSON.stringify(originalSlaveKeymaps);
+        const slaveEncodersChanged = JSON.stringify(slaveEncoders) !== JSON.stringify(originalSlaveEncoders);
+        hasChanges = keymapChanged || encodersChanged || slaveKeymapsChanged || slaveEncodersChanged;
         showSavePopup = hasChanges;
     }
 
@@ -87,30 +100,28 @@
             encoders = result.encoders || [];
             dataLoaded = true;
             
-            // Load I2C devices and their keymaps
-            loadingI2CDevices = true;
-            try {
-                i2cDevices = await invoke('get_i2c_devices');
-                console.log('I2C devices loaded:', i2cDevices);
-                
-                // Load slave keymaps for connected devices
-                for (const device of i2cDevices) {
-                    if (device.status === 1) { // Connected
-                        try {
-                            const slaveKeymap = await invoke('get_full_slave_keymap', { slaveAddr: device.address });
-                            slaveKeymaps[device.address] = slaveKeymap;
-                            console.log(`Loaded keymap for slave device ${device.address}`);
-                        } catch (e) {
-                            console.error(`Failed to load keymap for slave device ${device.address}:`, e);
-                        }
-                    }
+            // Only load I2C devices if this is a Master device (device_type = 1)
+            // Slave devices (device_type = 0) don't have slave devices to query
+            if (deviceInfo.device_type === 1) {
+                loadingI2CDevices = true;
+                try {
+                    i2cDevices = await invoke('get_i2c_devices');
+                    console.log('I2C devices loaded:', i2cDevices);
+                    
+                    // Don't load slave keymaps on initial connection - load on-demand when selected
+                    // This makes the initial connection faster
+                } catch (e) {
+                    console.error('Failed to load I2C devices:', e);
+                } finally {
+                    loadingI2CDevices = false;
                 }
-            } catch (e) {
-                console.error('Failed to load I2C devices:', e);
-            } finally {
-                loadingI2CDevices = false;
+            } else {
+                console.log('Connected to slave device - no I2C slaves to query');
+                i2cDevices = [];
             }
             
+            slaveKeymaps = {};
+            slaveEncoders = {};
             storeOriginalData();
             
             console.log('Connected successfully:', result);
@@ -144,10 +155,14 @@
             deviceInfo = null;
             keymap = [];
             encoders = [];
+            slaveKeymaps = {};
+            slaveEncoders = {};
             selectedKey = null;
             selectedEncoder = null;
             originalKeymap = [];
             originalEncoders = [];
+            originalSlaveKeymaps = {};
+            originalSlaveEncoders = {};
             dataLoaded = false;
             hasChanges = false;
             showSavePopup = false;
@@ -173,7 +188,7 @@
                 keymap = keymap;
             } else {
                 // Update slave device keymap
-                const slaveAddr = parseInt(selectedDevice);
+                    const slaveAddr = parseInt(selectedDevice, 10);
                 await invoke('set_slave_keymap_entry', {
                     entry: { slave_addr: slaveAddr, row, col, keycode }
                 });
@@ -197,34 +212,156 @@
         }
     }
     
+    // Load slave keymap on-demand
+    async function loadSlaveKeymap(slaveAddr) {
+        console.log(`[loadSlaveKeymap] Called with slaveAddr: ${slaveAddr}`);
+        
+        // Always reload for now (during debugging)
+        // TODO: Re-enable cache check after fixing the issue
+        // if (slaveKeymaps[slaveAddr] && slaveKeymaps[slaveAddr].length > 0) {
+        //     console.log(`[loadSlaveKeymap] Slave ${slaveAddr} keymap already loaded`);
+        //     return;
+        // }
+        
+        console.log(`[loadSlaveKeymap] Starting load for slave ${slaveAddr}...`);
+        loadingKeymap = true;
+        try {
+            console.log(`[loadSlaveKeymap] Invoking get_full_slave_keymap for slave 0x${slaveAddr.toString(16)}...`);
+            const slaveKeymap = await invoke('get_full_slave_keymap', { slaveAddr: slaveAddr });
+            console.log(`[loadSlaveKeymap] Received ${slaveKeymap.length} keymap entries for slave ${slaveAddr}`);
+            slaveKeymaps[slaveAddr] = slaveKeymap;
+            slaveKeymaps = {...slaveKeymaps}; // trigger reactivity
+            if (!originalSlaveKeymaps[String(slaveAddr)]) {
+                originalSlaveKeymaps[String(slaveAddr)] = JSON.parse(JSON.stringify(slaveKeymap));
+            }
+            checkForChanges();
+            console.log(`[loadSlaveKeymap] Successfully loaded keymap for slave device ${slaveAddr}`);
+        } catch (e) {
+            error = `Failed to load keymap for slave device ${slaveAddr}: ${e}`;
+            console.error(`[loadSlaveKeymap] Failed to load keymap for slave device ${slaveAddr}:`, e);
+        } finally {
+            loadingKeymap = false;
+            console.log(`[loadSlaveKeymap] Finished loading for slave ${slaveAddr}`);
+        }
+    }
+
+    async function loadSlaveEncoders(slaveAddr) {
+        console.log(`[loadSlaveEncoders] Called with slaveAddr: ${slaveAddr}`);
+        loadingEncoders = true;
+        try {
+            console.log(`[loadSlaveEncoders] Invoking get_full_slave_encoders for slave 0x${slaveAddr.toString(16)}...`);
+            const slaveEncoderList = await invoke('get_full_slave_encoders', { slaveAddr });
+            console.log(`[loadSlaveEncoders] Received ${slaveEncoderList.length} encoders for slave ${slaveAddr}`);
+            slaveEncoders[slaveAddr] = slaveEncoderList;
+            slaveEncoders = { ...slaveEncoders };
+            if (!originalSlaveEncoders[String(slaveAddr)]) {
+                originalSlaveEncoders[String(slaveAddr)] = JSON.parse(JSON.stringify(slaveEncoderList));
+            }
+            checkForChanges();
+        } catch (e) {
+            error = `Failed to load encoders for slave device ${slaveAddr}: ${e}`;
+            console.error(`[loadSlaveEncoders] Failed to load encoders for slave device ${slaveAddr}:`, e);
+        } finally {
+            loadingEncoders = false;
+            console.log(`[loadSlaveEncoders] Finished loading for slave ${slaveAddr}`);
+        }
+    }
+    
+    // Watch for device selection changes
+    $effect(() => {
+        console.log(`[EFFECT] selectedDevice changed to: ${selectedDevice}, isConnected: ${isConnected}`);
+        if (selectedDevice !== 'main' && isConnected) {
+            const slaveAddr = parseInt(selectedDevice, 10);
+            console.log(`[EFFECT] Loading keymap for slave: ${slaveAddr}`);
+            loadSlaveKeymap(slaveAddr);
+        } else {
+            console.log(`[EFFECT] Not loading slave keymap (selectedDevice=${selectedDevice}, isConnected=${isConnected})`);
+        }
+    });
+
+    $effect(() => {
+        if (selectedDevice !== 'main' && isConnected && selectedTab === 'encoders') {
+            const slaveAddr = parseInt(selectedDevice, 10);
+            console.log(`[EFFECT] Loading encoders for slave: ${slaveAddr}`);
+            loadSlaveEncoders(slaveAddr);
+        }
+    });
+    
     // Get the current active keymap based on selected device
     function getCurrentKeymap() {
         if (selectedDevice === 'main') {
             return keymap;
         } else {
-            const slaveAddr = parseInt(selectedDevice);
+            const slaveAddr = parseInt(selectedDevice, 10);
             return slaveKeymaps[slaveAddr] || [];
+        }
+    }
+
+    function getCurrentEncoders() {
+        if (selectedDevice === 'main') {
+            return encoders;
+        } else {
+            const slaveAddr = parseInt(selectedDevice, 10);
+            return slaveEncoders[slaveAddr] || [];
         }
     }
 
     async function updateEncoder(encoderId, ccwKeycode, cwKeycode) {
         try {
-            await invoke('set_encoder_entry', {
-                entry: {
-                    encoder_id: encoderId,
-                    ccw_keycode: ccwKeycode,
-                    cw_keycode: cwKeycode,
-                    reserved: 0
+            if (selectedDevice === 'main') {
+                await invoke('set_encoder_entry', {
+                    entry: {
+                        encoder_id: encoderId,
+                        ccw_keycode: ccwKeycode,
+                        cw_keycode: cwKeycode,
+                        reserved: 0
+                    }
+                });
+
+                const encoder = encoders.find(e => e.encoder_id === encoderId);
+                if (encoder) {
+                    encoder.ccw_keycode = ccwKeycode;
+                    encoder.cw_keycode = cwKeycode;
+                    encoders = encoders;
                 }
-            });
-            
-            const encoder = encoders.find(e => e.encoder_id === encoderId);
-            if (encoder) {
-                encoder.ccw_keycode = ccwKeycode;
-                encoder.cw_keycode = cwKeycode;
-                encoders = encoders;
-                checkForChanges();
+            } else {
+                const slaveAddr = parseInt(selectedDevice, 10);
+                const existingEncoders = slaveEncoders[slaveAddr] ? [...slaveEncoders[slaveAddr]] : [];
+                const entryIndex = existingEncoders.findIndex(e => e.encoder_id === encoderId);
+                const reserved = entryIndex >= 0 ? existingEncoders[entryIndex].reserved ?? 0 : 0;
+
+                await invoke('set_slave_encoder_entry', {
+                    entry: {
+                        slave_addr: slaveAddr,
+                        encoder_id: encoderId,
+                        ccw_keycode: ccwKeycode,
+                        cw_keycode: cwKeycode,
+                        reserved
+                    }
+                });
+
+                if (entryIndex >= 0) {
+                    existingEncoders[entryIndex] = {
+                        ...existingEncoders[entryIndex],
+                        ccw_keycode: ccwKeycode,
+                        cw_keycode: cwKeycode
+                    };
+                } else {
+                    existingEncoders.push({
+                        slave_addr: slaveAddr,
+                        encoder_id: encoderId,
+                        ccw_keycode: ccwKeycode,
+                        cw_keycode: cwKeycode,
+                        reserved
+                    });
+                }
+
+                slaveEncoders = {
+                    ...slaveEncoders,
+                    [slaveAddr]: existingEncoders
+                };
             }
+            checkForChanges();
         } catch (e) {
             error = `Failed to update encoder: ${e}`;
         }
@@ -435,6 +572,8 @@
     function discardChanges() {
         keymap = JSON.parse(JSON.stringify(originalKeymap));
         encoders = JSON.parse(JSON.stringify(originalEncoders));
+        slaveKeymaps = JSON.parse(JSON.stringify(originalSlaveKeymaps));
+        slaveEncoders = JSON.parse(JSON.stringify(originalSlaveEncoders));
         hasChanges = false;
         showSavePopup = false;
     }
@@ -549,6 +688,44 @@
             </div>
         </div>
 
+        {#if isConnected}
+            <div class="device-card-grid" role="tablist" aria-label="Device selection">
+                <button
+                    class="device-card"
+                    class:active={selectedDevice === 'main'}
+                    type="button"
+                    aria-pressed={selectedDevice === 'main'}
+                    onclick={() => setSelectedDevice('main')}
+                >
+                    <div class="device-card-image master-placeholder" aria-hidden="true"></div>
+                    <div class="device-card-content">
+                        <span class="device-card-title">{deviceInfo?.device_name || 'Main Device'}</span>
+                        <span class="device-card-subtitle">Master module</span>
+                    </div>
+                </button>
+
+                {#each i2cDevices as device}
+                    {#if device.status === 1}
+                        {#key device.address}
+                            <button
+                                class="device-card"
+                                class:active={selectedDevice === String(device.address)}
+                                type="button"
+                                aria-pressed={selectedDevice === String(device.address)}
+                                onclick={() => setSelectedDevice(String(device.address))}
+                            >
+                                <div class="device-card-image module-placeholder" aria-hidden="true"></div>
+                                <div class="device-card-content">
+                                    <span class="device-card-title">{device.name || `Slave 0x${device.address.toString(16).toUpperCase()}`}</span>
+                                    <span class="device-card-subtitle">Module connected</span>
+                                </div>
+                            </button>
+                        {/key}
+                    {/if}
+                {/each}
+            </div>
+        {/if}
+
         <nav class="tab-nav">
             <button 
                 class="tab-button"
@@ -583,26 +760,6 @@
            
         </nav>
 
-        {#if isConnected}
-            <div class="device-selector-container">
-                <label for="device-selector">Select Device:</label>
-                <select 
-                    id="device-selector" 
-                    bind:value={selectedDevice}
-                    class="device-selector"
-                >
-                    <option value="main">Main Device ({deviceInfo?.device_name || 'Unknown'})</option>
-                    {#each i2cDevices as device}
-                        {#if device.status === 1} <!-- Only show connected devices -->
-                            <option value={device.address}>
-                                Slave: {device.name || `Device at 0x${device.address.toString(16)}`}
-                            </option>
-                        {/if}
-                    {/each}
-                </select>
-            </div>
-        {/if}
-
         <div class="tab-content">
             {#if selectedTab === 'keymap'}
                 <div class="glass-card keymap-card">
@@ -611,11 +768,11 @@
                         <p>Click on any key to customize its function</p>
                     </div>
                     
-                    {#if loadingKeymap || (selectedDevice !== 'main' && loadingI2CDevices)}
+                    {#if loadingKeymap}
                         <div class="loading-state">
                             <div class="spinner-large"></div>
                             <h3>Loading Keymap...</h3>
-                            <p>Fetching key configuration from device</p>
+                            <p>{selectedDevice === 'main' ? 'Fetching key configuration from device' : `Loading keymap from slave device 0x${parseInt(selectedDevice, 10).toString(16).toUpperCase()}`}</p>
                         </div>
                     {:else if (selectedDevice === 'main' && keymap.length > 0) || (selectedDevice !== 'main' && slaveKeymaps[selectedDevice] && slaveKeymaps[selectedDevice].length > 0)}
                         <!-- keys open modal -->
@@ -658,20 +815,18 @@
                         <h2>Encoder Configuration</h2>
                         <p>Configure rotary encoder actions for clockwise and counter-clockwise rotation</p>
                     </div>
-                    
                     {#if loadingEncoders}
                         <div class="loading-state">
                             <div class="spinner-large"></div>
                             <h3>Loading Encoders...</h3>
-                            <p>Fetching encoder configuration from device</p>
+                            <p>{selectedDevice === 'main' ? 'Fetching encoder configuration from device' : `Loading encoders from slave device 0x${parseInt(selectedDevice, 10).toString(16).toUpperCase()}`}</p>
                         </div>
-                    {:else if encoders.length > 0}
-                         <!-- encoder list (open modal to edit) -->
+                    {:else if getCurrentEncoders().length > 0}
                         <div class="encoders-grid">
-                            {#each encoders as encoder}
+                            {#each getCurrentEncoders() as encoder (encoder.encoder_id)}
                                 <div class="encoder-item">
                                     <div class="encoder-header">
-                                        <h4>Encoder {encoder.encoder_id}</h4>
+                                        <h4>{selectedDevice === 'main' ? `Encoder ${encoder.encoder_id}` : `Module 0x${parseInt(selectedDevice, 10).toString(16).toUpperCase()} · Encoder ${encoder.encoder_id}`}</h4>
                                     </div>
                                     <div class="encoder-actions">
                                         <button 
@@ -709,6 +864,15 @@
                                     </div>
                                 </div>
                             {/each}
+                        </div>
+                    {:else if selectedDevice !== 'main'}
+                        <div class="empty-state">
+                            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2"/>
+                                <path d="M8 12L12 8L16 12L12 16L8 12Z" stroke="currentColor" stroke-width="2"/>
+                            </svg>
+                            <h3>No Encoders Found</h3>
+                            <p>This module does not report any encoder controls.</p>
                         </div>
                     {:else}
                         <div class="empty-state">
@@ -1427,6 +1591,95 @@
         cursor: not-allowed;
     }
 
+    /* Device selection cards */
+    .device-card-grid {
+        display: flex;
+        gap: 16px;
+        flex-wrap: wrap;
+        margin-bottom: 24px;
+    }
+
+    .device-card {
+        background: linear-gradient(135deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.02));
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 16px;
+        padding: 16px;
+        width: 200px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        align-items: flex-start;
+        color: #ffffff;
+        cursor: pointer;
+        transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+        background-origin: border-box;
+        outline: none;
+    }
+
+    .device-card:hover {
+        transform: translateY(-4px);
+        box-shadow: 0 12px 30px rgba(0, 0, 0, 0.25);
+    }
+
+    .device-card.active {
+        border-color: rgba(102, 126, 234, 0.8);
+        box-shadow: 0 12px 40px rgba(102, 126, 234, 0.25);
+    }
+
+    .device-card:focus-visible {
+        border-color: rgba(79, 209, 197, 0.9);
+        box-shadow: 0 0 0 3px rgba(79, 209, 197, 0.35);
+    }
+
+    .device-card-image {
+        width: 100%;
+        height: 96px;
+        border-radius: 12px;
+        background: rgba(255, 255, 255, 0.08);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: rgba(255, 255, 255, 0.6);
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+    }
+
+    .master-placeholder {
+        background: linear-gradient(135deg, rgba(102, 126, 234, 0.35), rgba(118, 75, 162, 0.35));
+        position: relative;
+    }
+
+    .master-placeholder::after {
+        content: 'MASTER';
+    }
+
+    .module-placeholder {
+        background: linear-gradient(135deg, rgba(72, 187, 255, 0.25), rgba(79, 209, 197, 0.25));
+        position: relative;
+    }
+
+    .module-placeholder::after {
+        content: 'MODULE';
+    }
+
+    .device-card-content {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        align-items: flex-start;
+    }
+
+    .device-card-title {
+        font-weight: 600;
+        font-size: 16px;
+    }
+
+    .device-card-subtitle {
+        font-size: 12px;
+        color: rgba(255, 255, 255, 0.65);
+    }
+
     /* Keymap */
     .keymap-container {
         display: flex;
@@ -1578,33 +1831,6 @@
         flex-wrap: wrap;
     }
 
-    .config-info {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-        gap: 16px;
-    }
-
-    .info-card {
-        background: rgba(255, 255, 255, 0.05);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        border-radius: 8px;
-        padding: 16px;
-        backdrop-filter: blur(10px);
-    }
-
-    .info-card h4 {
-        margin: 0 0 8px 0;
-        font-size: 14px;
-        font-weight: 600;
-        color: #ffffff;
-    }
-
-    .info-card p {
-        margin: 0;
-        font-size: 13px;
-        color: #a0a0a0;
-        line-height: 1.4;
-    }
 
     /* Empty State */
     .empty-state {
@@ -1825,17 +2051,6 @@
         gap: 12px;
     }
 
-    .preview-label {
-        font-size: 13px;
-        color: #a0a0a0;
-        font-weight: 500;
-    }
-
-    .preview-value {
-        font-size: 14px;
-        color: #ffffff;
-        font-weight: 600;
-    }
 
     .modal-footer {
         display: flex;

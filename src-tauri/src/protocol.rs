@@ -27,6 +27,8 @@ pub enum ConfigCommand {
     GetSlaveKeymap = 0x11,
     SetSlaveKeymap = 0x12,
     GetSlaveInfo = 0x13,
+    GetSlaveEncoder = 0x14,
+    SetSlaveEncoder = 0x15,
 }
                          
 impl From<u8> for ConfigCommand {
@@ -47,6 +49,8 @@ impl From<u8> for ConfigCommand {
             0x11 => ConfigCommand::GetSlaveKeymap,
             0x12 => ConfigCommand::SetSlaveKeymap,
             0x13 => ConfigCommand::GetSlaveInfo,
+            0x14 => ConfigCommand::GetSlaveEncoder,
+            0x15 => ConfigCommand::SetSlaveEncoder,
             _ => ConfigCommand::GetInfo, // Default fallback
         }
     }
@@ -56,25 +60,23 @@ impl From<u8> for ConfigCommand {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum StatusCode {
     Ok = 0x00,
-    InvalidCmd = 0x01,
-    InvalidParam = 0x02,
-    NotSupported = 0x03,
-    DeviceError = 0x04,
-    TimeoutError = 0x05,
-    BufferFull = 0x06,
+    Error = 0x01,          // STATUS_ERROR - generic error
+    InvalidCmd = 0x02,     // STATUS_INVALID_CMD - command not recognized
+    InvalidParam = 0x03,   // STATUS_INVALID_PARAM - invalid parameter
+    Busy = 0x04,           // STATUS_BUSY - device is busy
+    NotSupported = 0x05,   // STATUS_NOT_SUPPORTED - feature not supported
 }
 
 impl From<u8> for StatusCode {
     fn from(value: u8) -> Self {
         match value {
             0x00 => StatusCode::Ok,
-            0x01 => StatusCode::InvalidCmd,
-            0x02 => StatusCode::InvalidParam,
-            0x03 => StatusCode::NotSupported,
-            0x04 => StatusCode::DeviceError,
-            0x05 => StatusCode::TimeoutError,
-            0x06 => StatusCode::BufferFull,
-            _ => StatusCode::DeviceError, // Default fallback
+            0x01 => StatusCode::Error,
+            0x02 => StatusCode::InvalidCmd,
+            0x03 => StatusCode::InvalidParam,
+            0x04 => StatusCode::Busy,
+            0x05 => StatusCode::NotSupported,
+            _ => StatusCode::Error, // Default fallback
         }
     }
 }
@@ -205,6 +207,16 @@ pub struct SlaveKeymapEntry {
     pub keycode: u16,
 }
 
+/// Slave encoder entry structure (matches firmware)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlaveEncoderEntry {
+    pub slave_addr: u8,
+    pub encoder_id: u8,
+    pub ccw_keycode: u16,
+    pub cw_keycode: u16,
+    pub reserved: u8,
+}
+
 impl KeymapEntry {
     pub fn from_payload(payload: &[u8]) -> Result<Self, String> {
         if payload.len() < 4 {
@@ -220,16 +232,16 @@ impl KeymapEntry {
 }
 
 impl SlaveKeymapEntry {
-    pub fn from_payload(payload: &[u8]) -> Result<Self, String> {
-        if payload.len() < 5 {
+    pub fn from_payload(slave_addr: u8, payload: &[u8]) -> Result<Self, String> {
+        if payload.len() < 4 {
             return Err("Slave keymap entry payload too short".to_string());
         }
 
         Ok(SlaveKeymapEntry {
-            slave_addr: payload[0],
-            row: payload[1],
-            col: payload[2],
-            keycode: u16::from_le_bytes([payload[3], payload[4]]),
+            slave_addr,
+            row: payload[0],
+            col: payload[1],
+            keycode: u16::from_le_bytes([payload[2], payload[3]]),
         })
     }
     
@@ -300,31 +312,32 @@ pub struct I2CDeviceInfo {
 
 impl I2CDeviceInfo {
     pub fn from_payload_at_index(payload: &[u8], index: usize) -> Result<Self, String> {
-        // Each I2C device entry is 16 bytes
-        let offset = index * 16;
-        if payload.len() < offset + 16 {
+        // Each I2C device entry is 28 bytes (matches firmware i2c_device_info_t)
+        // Firmware structure: address(1) + device_type(1) + status(1) + fw_ver(3) + name(16) + reserved(6) = 28 bytes
+        let offset = index * 28;
+        if payload.len() < offset + 28 {
             return Err("I2C device info payload too short".to_string());
         }
 
-        // Extract device name (null-terminated string)
-        let name_bytes = &payload[offset + 5..offset + 10];
-        let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(5);
+        // Extract device name (null-terminated string, 16 bytes in firmware)
+        let name_bytes = &payload[offset + 6..offset + 22]; // name starts at offset 6 (after address, device_type, status, and 3 fw_ver bytes)
+        let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(16);
         let name = String::from_utf8_lossy(&name_bytes[..name_end]).to_string();
 
         Ok(I2CDeviceInfo {
             address: payload[offset],
-            status: payload[offset + 1],
-            firmware_version_major: payload[offset + 2],
-            firmware_version_minor: payload[offset + 3],
-            firmware_version_patch: payload[offset + 4],
+            status: payload[offset + 2], // status is at offset 2 (after address and device_type)
+            firmware_version_major: payload[offset + 3],
+            firmware_version_minor: payload[offset + 4],
+            firmware_version_patch: payload[offset + 5],
             name,
             reserved: [
-                payload[offset + 10],
-                payload[offset + 11],
-                payload[offset + 12],
-                payload[offset + 13],
-                payload[offset + 14],
-                payload[offset + 15],
+                payload[offset + 22],
+                payload[offset + 23],
+                payload[offset + 24],
+                payload[offset + 25],
+                payload[offset + 26],
+                payload[offset + 27],
             ],
         })
     }
@@ -351,5 +364,31 @@ impl I2CDeviceInfo {
             name,
             reserved,
         })
+    }
+}
+
+impl SlaveEncoderEntry {
+    pub fn from_payload(slave_addr: u8, payload: &[u8]) -> Result<Self, String> {
+        if payload.len() < 6 {
+            return Err("Slave encoder entry payload too short".to_string());
+        }
+
+        Ok(SlaveEncoderEntry {
+            slave_addr,
+            encoder_id: payload[0],
+            ccw_keycode: u16::from_le_bytes([payload[1], payload[2]]),
+            cw_keycode: u16::from_le_bytes([payload[3], payload[4]]),
+            reserved: payload[5],
+        })
+    }
+
+    pub fn to_payload(&self) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.push(self.slave_addr);
+        payload.push(self.encoder_id);
+        payload.extend_from_slice(&self.ccw_keycode.to_le_bytes());
+        payload.extend_from_slice(&self.cw_keycode.to_le_bytes());
+        payload.push(self.reserved);
+        payload
     }
 }
