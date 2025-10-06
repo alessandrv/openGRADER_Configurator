@@ -47,6 +47,7 @@ pub fn run() {
             // State management  
             load_full_state,
             get_enhanced_connection_status,
+            get_board_layout,
             
             // Keymap management
             get_keymap_entry,

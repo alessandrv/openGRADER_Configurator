@@ -1,5 +1,5 @@
 use crate::hid_manager::{HidManager, DeviceDescriptor};
-use crate::protocol::{DeviceInfo, KeymapEntry, EncoderEntry, I2CDeviceInfo, SlaveKeymapEntry, SlaveEncoderEntry};
+use crate::protocol::{DeviceInfo, KeymapEntry, EncoderEntry, I2CDeviceInfo, SlaveKeymapEntry, SlaveEncoderEntry, BoardLayoutInfo};
 use std::sync::Arc;
 use tauri::{AppHandle, State, Emitter};
 use tokio::sync::RwLock;
@@ -76,6 +76,12 @@ pub async fn get_connection_status(state: State<'_, AppState>) -> Result<Connect
 pub async fn ping_device(state: State<'_, AppState>) -> Result<bool, String> {
     let manager = state.read().await;
     Ok(manager.is_connected())
+}
+
+#[tauri::command]
+pub async fn get_board_layout(state: State<'_, AppState>) -> Result<BoardLayoutInfo, String> {
+    let manager = state.read().await;
+    manager.get_board_layout().await
 }
 
 #[tauri::command]
@@ -179,7 +185,20 @@ pub async fn simple_connect(state: State<'_, AppState>) -> Result<FullState, Str
     println!("simple_connect: device connected: {} ({}x{} matrix, {} encoders)", 
              device_info.device_name, device_info.matrix_rows, device_info.matrix_cols, device_info.encoder_count);
     
-    // Step 3: Load keymap
+    // Step 3: Fetch layout metadata (optional but preferred)
+    println!("simple_connect: fetching board layout metadata...");
+    let layout = {
+        let manager = state.read().await;
+        match manager.get_board_layout().await {
+            Ok(info) => Some(info),
+            Err(e) => {
+                println!("simple_connect: warning - failed to fetch board layout: {}", e);
+                None
+            }
+        }
+    };
+    
+    // Step 4: Load keymap
     println!("simple_connect: loading keymap...");
     let keymap = {
         let manager = state.read().await;
@@ -211,7 +230,7 @@ pub async fn simple_connect(state: State<'_, AppState>) -> Result<FullState, Str
         keymap
     };
     
-    // Step 4: Load encoders
+    // Step 5: Load encoders
     println!("simple_connect: loading encoders...");
     let encoders = {
         let manager = state.read().await;
@@ -236,7 +255,7 @@ pub async fn simple_connect(state: State<'_, AppState>) -> Result<FullState, Str
     };
     
     println!("simple_connect: all data loaded successfully");
-    Ok(FullState { device_info, keymap, encoders })
+    Ok(FullState { device_info, keymap, encoders, layout })
 }
 
 // Simple disconnect command
@@ -254,12 +273,21 @@ pub struct FullState {
     pub device_info: DeviceInfo,
     pub keymap: Vec<Vec<KeymapEntry>>,
     pub encoders: Vec<EncoderEntry>,
+    pub layout: Option<BoardLayoutInfo>,
 }
 
 #[tauri::command]
 pub async fn load_full_state(state: State<'_, AppState>) -> Result<FullState, String> {
     let manager = state.read().await;
     let device_info = manager.get_device_info().await?;
+
+    let layout = match manager.get_board_layout().await {
+        Ok(info) => Some(info),
+        Err(e) => {
+            println!("load_full_state: warning - no layout info available: {}", e);
+            None
+        }
+    };
 
     // Build keymap
     let mut keymap = Vec::new();
@@ -283,7 +311,7 @@ pub async fn load_full_state(state: State<'_, AppState>) -> Result<FullState, St
         }
     }
 
-    Ok(FullState { device_info, keymap, encoders })
+    Ok(FullState { device_info, keymap, encoders, layout })
 }
 
 // Enhanced connection status that includes all data in one call
@@ -293,6 +321,7 @@ pub struct EnhancedConnectionStatus {
     pub device_info: Option<DeviceInfo>,
     pub keymap: Option<Vec<Vec<KeymapEntry>>>,
     pub encoders: Option<Vec<EncoderEntry>>,
+    pub layout: Option<BoardLayoutInfo>,
     pub error: Option<String>,
 }
 
@@ -308,6 +337,7 @@ pub async fn get_enhanced_connection_status(state: State<'_, AppState>) -> Resul
             device_info: None,
             keymap: None,
             encoders: None,
+            layout: None,
             error: None,
         });
     }
@@ -326,6 +356,7 @@ pub async fn get_enhanced_connection_status(state: State<'_, AppState>) -> Resul
                 device_info: None,
                 keymap: None,
                 encoders: None,
+                layout: None,
                 error: Some(format!("Failed to get device info: {}", e)),
             });
         },
@@ -359,12 +390,21 @@ pub async fn get_enhanced_connection_status(state: State<'_, AppState>) -> Resul
     }
     println!("Encoders built: {} encoders", encoders.len());
 
+    let layout = match manager.get_board_layout().await {
+        Ok(info) => Some(info),
+        Err(e) => {
+            println!("Enhanced connection status: layout unavailable: {}", e);
+            None
+        }
+    };
+
     println!("Enhanced connection status complete: connected=true");
     Ok(EnhancedConnectionStatus {
         connected: true,
         device_info,
         keymap: Some(keymap),
         encoders: Some(encoders),
+        layout,
         error: None,
     })
 }

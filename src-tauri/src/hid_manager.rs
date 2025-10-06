@@ -450,6 +450,30 @@ impl HidManager {
         Ok(response)
     }
 
+    /// Get board layout metadata
+    pub async fn get_board_layout(&self) -> Result<BoardLayoutInfo, String> {
+        if *self.is_mock_device.lock().unwrap() {
+            return Ok(BoardLayoutInfo {
+                version: 1,
+                matrix_rows: 4,
+                matrix_cols: 4,
+                encoder_count: 2,
+                first_encoder_column: 2,
+                encoders_per_row: 2,
+                bitmap_length: 1,
+                encoder_bitmap: vec![0b00111100],
+            });
+        }
+
+        let response = self.send_command(ConfigCommand::GetLayoutInfo, &[]).await?;
+        let status = StatusCode::from(response.status);
+        if !matches!(status, StatusCode::Ok) {
+            return Err(format!("Device returned error: {:?}", status));
+        }
+
+        BoardLayoutInfo::from_payload(&response.payload[..response.payload_length as usize])
+    }
+
     /// Get device information
     pub async fn get_device_info(&self) -> Result<DeviceInfo, String> {
         // Handle mock device

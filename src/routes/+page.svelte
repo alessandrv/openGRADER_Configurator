@@ -23,6 +23,8 @@
     let slaveKeymaps = $state({}); // Map of slave address -> keymap
     let slaveEncoders = $state({}); // Map of slave address -> encoders
     let encoders = $state([]);
+    let boardLayout = $state(null);
+    let activeEncoderMenu = $state(null);
     let keycodes = {};
     
     // UI state
@@ -46,10 +48,19 @@
     let encoderModalTab = $state('standard');
     let encoderModalDirection = $state('ccw'); // 'ccw' or 'cw'
 
-    onMount(async () => {
+    onMount(() => {
         console.log('=== FRONTEND: App started ===');
-        await loadKeycodes();
-        console.log('=== FRONTEND: App ready ===');
+        loadKeycodes().finally(() => {
+            console.log('=== FRONTEND: App ready ===');
+        });
+
+        document.addEventListener('pointerdown', handleGlobalPointerDown);
+        document.addEventListener('keydown', handleGlobalKeydown);
+
+        return () => {
+            document.removeEventListener('pointerdown', handleGlobalPointerDown);
+            document.removeEventListener('keydown', handleGlobalKeydown);
+        };
     });
 
     // Load keycodes from backend
@@ -98,7 +109,19 @@
             deviceInfo = result.device_info;
             keymap = result.keymap || [];
             encoders = result.encoders || [];
+            boardLayout = result.layout ?? null;
             dataLoaded = true;
+
+            if (!boardLayout) {
+                try {
+                    boardLayout = await invoke('get_board_layout');
+                } catch (layoutError) {
+                    console.warn('Failed to fetch board layout metadata:', layoutError);
+                }
+            }
+            activeEncoderMenu = null;
+
+            console.log('Loaded layout metadata:', boardLayout);
             
             // Only load I2C devices if this is a Master device (device_type = 1)
             // Slave devices (device_type = 0) don't have slave devices to query
@@ -136,6 +159,8 @@
             encoders = [];
             i2cDevices = [];
             slaveKeymaps = {};
+            boardLayout = null;
+            activeEncoderMenu = null;
             dataLoaded = false;
         }
         
@@ -157,8 +182,10 @@
             encoders = [];
             slaveKeymaps = {};
             slaveEncoders = {};
+            boardLayout = null;
             selectedKey = null;
             selectedEncoder = null;
+            activeEncoderMenu = null;
             originalKeymap = [];
             originalEncoders = [];
             originalSlaveKeymaps = {};
@@ -270,20 +297,21 @@
     // Watch for device selection changes
     $effect(() => {
         console.log(`[EFFECT] selectedDevice changed to: ${selectedDevice}, isConnected: ${isConnected}`);
+        activeEncoderMenu = null;
         if (selectedDevice !== 'main' && isConnected) {
             const slaveAddr = parseInt(selectedDevice, 10);
             console.log(`[EFFECT] Loading keymap for slave: ${slaveAddr}`);
             loadSlaveKeymap(slaveAddr);
+            loadSlaveEncoders(slaveAddr);
         } else {
             console.log(`[EFFECT] Not loading slave keymap (selectedDevice=${selectedDevice}, isConnected=${isConnected})`);
         }
     });
 
+    // Ensure encoder layouts refresh when board metadata changes
     $effect(() => {
-        if (selectedDevice !== 'main' && isConnected && selectedTab === 'encoders') {
-            const slaveAddr = parseInt(selectedDevice, 10);
-            console.log(`[EFFECT] Loading encoders for slave: ${slaveAddr}`);
-            loadSlaveEncoders(slaveAddr);
+        if (!isConnected) {
+            activeEncoderMenu = null;
         }
     });
     
@@ -304,6 +332,116 @@
             const slaveAddr = parseInt(selectedDevice, 10);
             return slaveEncoders[slaveAddr] || [];
         }
+    }
+
+    function getCurrentLayout() {
+        return boardLayout;
+    }
+
+    function isEncoderCell(row, col) {
+        const layout = getCurrentLayout();
+        if (!layout) return false;
+        const cols = layout.matrix_cols ?? 0;
+        if (col >= cols) return false;
+        const index = row * cols + col;
+        const byteIndex = Math.floor(index / 8);
+        const bitIndex = index % 8;
+        const bitmap = layout.encoder_bitmap || [];
+        const byte = bitmap[byteIndex] ?? 0;
+        return (byte & (1 << bitIndex)) !== 0;
+    }
+
+    function encoderIdForCell(row, col) {
+        const layout = getCurrentLayout();
+        if (!layout) return null;
+        if (!isEncoderCell(row, col)) return null;
+
+        const firstEncoderColumn = layout.first_encoder_column ?? 0;
+        if (col < firstEncoderColumn) return null;
+
+        const perRow = layout.encoders_per_row ?? 0;
+        if (!perRow) return null;
+
+        const offsetCol = col - firstEncoderColumn;
+        const id = row * perRow + offsetCol;
+        return id < (layout.encoder_count ?? 0) ? id : null;
+    }
+
+    function getEncoderEntryById(encoderId) {
+        return getCurrentEncoders().find((encoder) => encoder.encoder_id === encoderId) || null;
+    }
+
+    function closeEncoderMenu() {
+        activeEncoderMenu = null;
+    }
+
+    /** @param {PointerEvent} event */
+    function handleGlobalPointerDown(event) {
+        if (!activeEncoderMenu) return;
+        const target = event.target;
+        if (!(target instanceof Element)) {
+            return;
+        }
+
+        if (target.closest('.encoder-menu') || target.closest('.encoder-key')) {
+            return;
+        }
+
+        closeEncoderMenu();
+    }
+
+    /** @param {KeyboardEvent} event */
+    function handleGlobalKeydown(event) {
+        if (!activeEncoderMenu) return;
+        if (event.key === 'Escape') {
+            closeEncoderMenu();
+        }
+    }
+
+    function toggleEncoderMenu(row, col, event) {
+        if (event) {
+            event.stopPropagation();
+        }
+        if (loadingEncoders || loadingKeymap) {
+            return;
+        }
+        const encoderId = encoderIdForCell(row, col);
+        if (encoderId === null) return;
+
+        if (activeEncoderMenu && activeEncoderMenu.row === row && activeEncoderMenu.col === col) {
+            activeEncoderMenu = null;
+        } else {
+            activeEncoderMenu = { row, col, encoderId };
+        }
+    }
+
+    function handleEncoderAction(row, col, action, event) {
+        if (event) {
+            event.stopPropagation();
+        }
+
+        const encoderId = encoderIdForCell(row, col);
+        if (encoderId === null) {
+            return;
+        }
+
+        const encoderEntry = getEncoderEntryById(encoderId) || {
+            encoder_id: encoderId,
+            ccw_keycode: 0,
+            cw_keycode: 0,
+            reserved: 0
+        };
+
+        if (action === 'press') {
+            const currentKeymap = getCurrentKeymap();
+            const key = currentKeymap?.[row]?.[col];
+            const keycode = key?.keycode ?? 0;
+            openKeyModal(row, col, keycode);
+        } else if (action === 'ccw' || action === 'cw') {
+            openEncoderModal(encoderEntry, action);
+        }
+
+        activeEncoderMenu = null;
     }
 
     async function updateEncoder(encoderId, ccwKeycode, cwKeycode) {
@@ -497,6 +635,7 @@
         modalKey = { row, col, keycode };
         keyModalTab = 'standard';
         showKeyModal = true;
+        activeEncoderMenu = null;
     }
 
     function closeKeyModal() {
@@ -516,6 +655,7 @@
         encoderModalDirection = direction;
         encoderModalTab = 'standard';
         showEncoderModal = true;
+        activeEncoderMenu = null;
     }
 
     function closeEncoderModal() {
@@ -744,20 +884,6 @@
                 </svg>
                 <span>Keymap</span>
             </button>
-            <button 
-                class="tab-button"
-                class:active={selectedTab === 'encoders'}
-                onclick={() => selectedTab = 'encoders'}
-                disabled={!isConnected}
-                aria-label="Encoders Tab"
-            >
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                    <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2"/>
-                    <path d="M8 12L12 8L16 12L12 16L8 12Z" stroke="currentColor" stroke-width="2"/>
-                </svg>
-                <span>Encoders</span>
-            </button>
-           
         </nav>
 
         <div class="tab-content">
@@ -777,22 +903,65 @@
                     {:else if (selectedDevice === 'main' && keymap.length > 0) || (selectedDevice !== 'main' && slaveKeymaps[selectedDevice] && slaveKeymaps[selectedDevice].length > 0)}
                         <!-- keys open modal -->
                         <div class="keymap-container">
-                            <div class="keymap">
+                            <div
+                                class="keymap"
+                                class:loading={loadingKeymap || loadingEncoders}
+                                aria-busy={loadingKeymap || loadingEncoders}
+                            >
                                 {#each getCurrentKeymap() as row, rowIndex}
                                     <div class="keymap-row">
                                         {#each row as key, colIndex}
-                                            <button 
-                                                class="key"
-                                                onclick={() => openKeyModal(rowIndex, colIndex, key.keycode)}
-                                                aria-label={`Key R${rowIndex}C${colIndex}`}>
-                                                {#each formatKeyLabel(key.keycode) as line}
-                                                   <div class="key-label">{line}</div>
-                                                {/each}
-                                            </button>
+                                            <div class={`keymap-cell ${isEncoderCell(rowIndex, colIndex) ? 'encoder-cell' : ''}`}>
+                                                {#if isEncoderCell(rowIndex, colIndex)}
+                                                    <button
+                                                        class="key encoder-key"
+                                                        class:menu-open={activeEncoderMenu && activeEncoderMenu.row === rowIndex && activeEncoderMenu.col === colIndex}
+                                                        onclick={(event) => toggleEncoderMenu(rowIndex, colIndex, event)}
+                                                        aria-label={`Encoder ${encoderIdForCell(rowIndex, colIndex) ?? ''} at R${rowIndex}C${colIndex}`}
+                                                    >
+                                                        <span class="encoder-id">{encoderIdForCell(rowIndex, colIndex) ?? '—'}</span>
+                                                        {#if key}
+                                                            {#each formatKeyLabel(key.keycode) as line}
+                                                                <div class="key-label">{line}</div>
+                                                            {/each}
+                                                        {/if}
+                                                    </button>
+                                                    <div class={`encoder-menu ${activeEncoderMenu && activeEncoderMenu.row === rowIndex && activeEncoderMenu.col === colIndex ? 'active' : ''}`}>
+                                                        <button class="encoder-action ccw" onclick={(event) => handleEncoderAction(rowIndex, colIndex, 'ccw', event)}>
+                                                            <span class="encoder-action-icon">⟲</span>
+                                                            <span class="encoder-action-label">CCW</span>
+                                                        </button>
+                                                        <button class="encoder-action press" onclick={(event) => handleEncoderAction(rowIndex, colIndex, 'press', event)}>
+                                                            <span class="encoder-action-icon">●</span>
+                                                            <span class="encoder-action-label">Press</span>
+                                                        </button>
+                                                        <button class="encoder-action cw" onclick={(event) => handleEncoderAction(rowIndex, colIndex, 'cw', event)}>
+                                                            <span class="encoder-action-icon">⟳</span>
+                                                            <span class="encoder-action-label">CW</span>
+                                                        </button>
+                                                    </div>
+                                                {:else}
+                                                    <button
+                                                        class="key"
+                                                        onclick={() => openKeyModal(rowIndex, colIndex, key.keycode)}
+                                                        aria-label={`Key R${rowIndex}C${colIndex}`}
+                                                    >
+                                                        {#each formatKeyLabel(key.keycode) as line}
+                                                            <div class="key-label">{line}</div>
+                                                        {/each}
+                                                    </button>
+                                                {/if}
+                                            </div>
                                         {/each}
                                     </div>
                                 {/each}
                             </div>
+                            {#if loadingKeymap || loadingEncoders}
+                                <div class="keymap-overlay" aria-live="polite">
+                                    <div class="spinner spinner-small"></div>
+                                    <span>Loading layout…</span>
+                                </div>
+                            {/if}
                         </div>
                     {:else}
                         <div class="empty-state">
@@ -808,85 +977,6 @@
                     {/if}
                 </div>
             {/if}
-
-            {#if selectedTab === 'encoders'}
-                <div class="glass-card encoders-card">
-                    <div class="card-header">
-                        <h2>Encoder Configuration</h2>
-                        <p>Configure rotary encoder actions for clockwise and counter-clockwise rotation</p>
-                    </div>
-                    {#if loadingEncoders}
-                        <div class="loading-state">
-                            <div class="spinner-large"></div>
-                            <h3>Loading Encoders...</h3>
-                            <p>{selectedDevice === 'main' ? 'Fetching encoder configuration from device' : `Loading encoders from slave device 0x${parseInt(selectedDevice, 10).toString(16).toUpperCase()}`}</p>
-                        </div>
-                    {:else if getCurrentEncoders().length > 0}
-                        <div class="encoders-grid">
-                            {#each getCurrentEncoders() as encoder (encoder.encoder_id)}
-                                <div class="encoder-item">
-                                    <div class="encoder-header">
-                                        <h4>{selectedDevice === 'main' ? `Encoder ${encoder.encoder_id}` : `Module 0x${parseInt(selectedDevice, 10).toString(16).toUpperCase()} · Encoder ${encoder.encoder_id}`}</h4>
-                                    </div>
-                                    <div class="encoder-actions">
-                                        <button 
-                                            class="encoder-direction-btn ccw"
-                                            onclick={() => openEncoderModal(encoder, 'ccw')}
-                                        >
-                                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                                <path d="M15 18L9 12L15 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                                            </svg>
-                                            <div class="direction-info">
-                                                <span class="direction-label">Counter-Clockwise</span>
-                                                <div class="direction-value">
-                                                    {#each formatKeyLabel(encoder.ccw_keycode) as line}
-                                                        <div class="value-line">{line}</div>
-                                                    {/each}
-                                                </div>
-                                            </div>
-                                        </button>
-                                        <button 
-                                            class="encoder-direction-btn cw"
-                                            onclick={() => openEncoderModal(encoder, 'cw')}
-                                        >
-                                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                                <path d="M9 18L15 12L9 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                                            </svg>
-                                            <div class="direction-info">
-                                                <span class="direction-label">Clockwise</span>
-                                                <div class="direction-value">
-                                                    {#each formatKeyLabel(encoder.cw_keycode) as line}
-                                                        <div class="value-line">{line}</div>
-                                                    {/each}
-                                                </div>
-                                            </div>
-                                        </button>
-                                    </div>
-                                </div>
-                            {/each}
-                        </div>
-                    {:else if selectedDevice !== 'main'}
-                        <div class="empty-state">
-                            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2"/>
-                                <path d="M8 12L12 8L16 12L12 16L8 12Z" stroke="currentColor" stroke-width="2"/>
-                            </svg>
-                            <h3>No Encoders Found</h3>
-                            <p>This module does not report any encoder controls.</p>
-                        </div>
-                    {:else}
-                        <div class="empty-state">
-                            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2"/>
-                                <path d="M8 12L12 8L16 12L12 16L8 12Z" stroke="currentColor" stroke-width="2"/>
-                            </svg>
-                            <h3>No Encoders Available</h3>
-                            <p>Connect to a device to view and configure encoders</p>
-                        </div>
-                    {/if}
-                </div>
-            {/if}
-
             {#if selectedTab === 'config'}
                 <div class="glass-card config-card">
                     <div class="card-header">
@@ -1682,14 +1772,22 @@
 
     /* Keymap */
     .keymap-container {
+        position: relative;
         display: flex;
         justify-content: center;
+        padding: 8px;
     }
 
     .keymap {
+        position: relative;
         display: flex;
         flex-direction: column;
         gap: 4px;
+        transition: opacity 0.2s ease;
+    }
+
+    .keymap.loading {
+        opacity: 0.35;
     }
 
     .keymap-row {
@@ -1697,9 +1795,18 @@
         gap: 4px;
     }
 
-    .key {
+    .keymap-cell {
+        position: relative;
         width: 64px;
         height: 64px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    .key {
+        width: 100%;
+        height: 100%;
         padding: 8px;
         background: rgba(255, 255, 255, 0.05);
         border: 1px solid rgba(255, 255, 255, 0.1);
@@ -1745,6 +1852,162 @@
         z-index: 1;
     }
 
+    .encoder-key {
+        border-radius: 999px;
+        width: 56px;
+        height: 56px;
+        padding: 12px;
+        border: 2px solid rgba(255, 255, 255, 0.25);
+        background: radial-gradient(circle at 30% 30%, rgba(255, 255, 255, 0.28) 0%, rgba(102, 126, 234, 0.12) 45%, rgba(118, 75, 162, 0.08) 100%);
+        box-shadow: 0 6px 18px rgba(102, 126, 234, 0.25);
+        gap: 6px;
+    }
+
+    .encoder-key:hover {
+        border-color: rgba(129, 140, 248, 0.8);
+        box-shadow: 0 10px 24px rgba(102, 126, 234, 0.35);
+    }
+
+    .encoder-key.menu-open {
+        border-color: rgba(129, 140, 248, 0.9);
+        box-shadow: 0 12px 36px rgba(102, 126, 234, 0.45);
+    }
+
+    .encoder-id {
+        font-size: 12px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        color: rgba(255, 255, 255, 0.8);
+        position: relative;
+        z-index: 1;
+    }
+
+    .encoder-key .key-label {
+        font-size: 10px;
+        opacity: 0.85;
+    }
+
+    .keymap-overlay {
+        position: absolute;
+        inset: 8px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+        background: rgba(12, 12, 20, 0.68);
+        border-radius: 16px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        color: #ffffff;
+        font-size: 13px;
+        font-weight: 500;
+        z-index: 5;
+        pointer-events: none;
+    }
+
+    .encoder-menu {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.18s ease;
+        z-index: 3;
+    }
+
+    .encoder-menu.active {
+        opacity: 1;
+    }
+
+    .encoder-action {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        width: 38px;
+        height: 38px;
+        border-radius: 999px;
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        background: linear-gradient(135deg, rgba(102, 126, 234, 0.95), rgba(118, 75, 162, 0.95));
+        color: #ffffff;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 2px;
+        transform: translate(-50%, -50%) scale(0.45);
+        opacity: 0;
+        transition: transform 0.28s cubic-bezier(0.24, 0.8, 0.25, 1), opacity 0.22s ease;
+        box-shadow: 0 6px 16px rgba(102, 126, 234, 0.35);
+        pointer-events: none;
+    }
+
+    .encoder-menu.active .encoder-action {
+        opacity: 1;
+        pointer-events: auto;
+        transform: translate(calc(-50% + var(--dx, 0px)), calc(-50% + var(--dy, -48px))) scale(1);
+    }
+
+    .encoder-action.ccw {
+        --dx: -34px;
+        --dy: -42px;
+    }
+
+    .encoder-action.press {
+        --dx: 0px;
+        --dy: -58px;
+        background: linear-gradient(135deg, rgba(255, 255, 255, 0.3), rgba(129, 140, 248, 0.95));
+        color: #0f172a;
+    }
+
+    .encoder-action.cw {
+        --dx: 34px;
+        --dy: -42px;
+    }
+
+    .encoder-menu.active .encoder-action.ccw { transition-delay: 0.02s; }
+    .encoder-menu.active .encoder-action.press { transition-delay: 0.08s; }
+    .encoder-menu.active .encoder-action.cw { transition-delay: 0.14s; }
+
+    .encoder-action:hover {
+        transform: translate(calc(-50% + var(--dx, 0px)), calc(-50% + var(--dy, -48px))) scale(1.05);
+        box-shadow: 0 10px 24px rgba(102, 126, 234, 0.45);
+    }
+
+    .encoder-action-icon {
+        font-size: 14px;
+        line-height: 1;
+    }
+
+    .encoder-action-label {
+        position: absolute;
+        top: calc(100% + 4px);
+        left: 50%;
+        transform: translateX(-50%);
+        font-size: 10px;
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: rgba(255, 255, 255, 0.85);
+        white-space: nowrap;
+        pointer-events: none;
+    }
+
+    .encoder-action.press .encoder-action-label {
+        color: rgba(15, 23, 42, 0.85);
+    }
+
+    .keymap-container .spinner-small {
+        color: #9ca3af;
+    }
+
+    .spinner-small {
+        width: 20px;
+        height: 20px;
+        border-width: 2px;
+    }
+
     /* Keep key cells square and multiline labels compact */
     .key { display:flex; align-items:center; justify-content:center; text-align:center; }
     .preview-compact { display:flex; flex-direction:column; gap:2px; align-items:center; }
@@ -1752,76 +2015,7 @@
     .muted { font-size:12px; color:#a0a0a0; margin-top:6px; }
 
     /* Encoder value lines fit in one row when possible */
-    .value-line { display:inline-block; font-size:13px; }
-
-    /* Encoders */
-    .encoders-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-        gap: 20px;
-    }
-
-    .encoder-item {
-        background: rgba(255, 255, 255, 0.05);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        border-radius: 12px;
-        padding: 20px;
-        backdrop-filter: blur(10px);
-    }
-
-    .encoder-header h4 {
-        margin: 0 0 16px 0;
-        font-size: 16px;
-        font-weight: 600;
-        color: #ffffff;
-    }
-
-    .encoder-actions {
-        display: flex;
-        flex-direction: column;
-        gap: 12px;
-    }
-
-    .encoder-direction-btn {
-        display: flex;
-        align-items: center;
-        gap: 12px;
-        padding: 16px;
-        background: rgba(255, 255, 255, 0.05);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        border-radius: 8px;
-        cursor: pointer;
-        transition: all 0.2s;
-        color: #ffffff;
-    }
-
-    .encoder-direction-btn:hover {
-        background: rgba(255, 255, 255, 0.1);
-        border-color: rgba(102, 126, 234, 0.5);
-        transform: translateX(4px);
-    }
-
-    .direction-info {
-        flex: 1;
-        text-align: left;
-    }
-
-    .direction-label {
-        display: block;
-        font-size: 12px;
-        color: #a0a0a0;
-        margin-bottom: 4px;
-    }
-
-    .direction-value {
-        font-size: 14px;
-        font-weight: 500;
-        color: #ffffff;
-    }
-
-    .value-line {
-        line-height: 1.3;
-    }
+    .value-line { display:inline-block; font-size:13px; line-height:1.3; }
 
     /* Configuration */
     .config-actions {

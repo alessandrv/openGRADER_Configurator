@@ -29,6 +29,7 @@ pub enum ConfigCommand {
     GetSlaveInfo = 0x13,
     GetSlaveEncoder = 0x14,
     SetSlaveEncoder = 0x15,
+    GetLayoutInfo = 0x16,
 }
                          
 impl From<u8> for ConfigCommand {
@@ -51,6 +52,7 @@ impl From<u8> for ConfigCommand {
             0x13 => ConfigCommand::GetSlaveInfo,
             0x14 => ConfigCommand::GetSlaveEncoder,
             0x15 => ConfigCommand::SetSlaveEncoder,
+            0x16 => ConfigCommand::GetLayoutInfo,
             _ => ConfigCommand::GetInfo, // Default fallback
         }
     }
@@ -390,5 +392,93 @@ impl SlaveEncoderEntry {
         payload.extend_from_slice(&self.cw_keycode.to_le_bytes());
         payload.push(self.reserved);
         payload
+    }
+}
+
+/// Board layout metadata structure (matches firmware board_layout_info_t)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardLayoutInfo {
+    pub version: u8,
+    pub matrix_rows: u8,
+    pub matrix_cols: u8,
+    pub encoder_count: u8,
+    pub first_encoder_column: u8,
+    pub encoders_per_row: u8,
+    pub bitmap_length: u8,
+    pub encoder_bitmap: Vec<u8>,
+}
+
+impl BoardLayoutInfo {
+    pub fn from_payload(payload: &[u8]) -> Result<Self, String> {
+        if payload.len() < 7 {
+            return Err("Board layout payload too short".to_string());
+        }
+
+        let bitmap_length = payload[6] as usize;
+        let expected_len = 8 + bitmap_length;
+        if payload.len() < expected_len {
+            return Err(format!(
+                "Board layout payload truncated: expected {} bytes, got {}",
+                expected_len,
+                payload.len()
+            ));
+        }
+
+        let mut bitmap = Vec::with_capacity(bitmap_length);
+        bitmap.extend_from_slice(&payload[8..8 + bitmap_length]);
+
+        Ok(BoardLayoutInfo {
+            version: payload[0],
+            matrix_rows: payload[1],
+            matrix_cols: payload[2],
+            encoder_count: payload[3],
+            first_encoder_column: payload[4],
+            encoders_per_row: payload[5],
+            bitmap_length: payload[6],
+            encoder_bitmap: bitmap,
+        })
+    }
+
+    pub fn cell_index(&self, row: u8, col: u8) -> Option<usize> {
+        if row >= self.matrix_rows || col >= self.matrix_cols {
+            return None;
+        }
+        Some((row as usize) * self.matrix_cols as usize + col as usize)
+    }
+
+    pub fn is_encoder_cell(&self, row: u8, col: u8) -> bool {
+        if let Some(index) = self.cell_index(row, col) {
+            let byte_index = index / 8;
+            let bit_index = index % 8;
+            if byte_index >= self.encoder_bitmap.len() {
+                return false;
+            }
+            (self.encoder_bitmap[byte_index] & (1 << bit_index)) != 0
+        } else {
+            false
+        }
+    }
+
+    pub fn encoder_id_for_cell(&self, row: u8, col: u8) -> Option<u8> {
+        if !self.is_encoder_cell(row, col) {
+            return None;
+        }
+
+        if col < self.first_encoder_column {
+            return None;
+        }
+
+        let col_offset = col - self.first_encoder_column;
+        let per_row = self.encoders_per_row;
+        if per_row == 0 {
+            return None;
+        }
+
+        let id = (row as u16) * (per_row as u16) + (col_offset as u16);
+        if id < self.encoder_count as u16 {
+            Some(id as u8)
+        } else {
+            None
+        }
     }
 }
