@@ -47,6 +47,10 @@
     let keyModalTab = $state('standard'); // 'standard' or 'midi'
     let encoderModalTab = $state('standard');
     let encoderModalDirection = $state('ccw'); // 'ccw' or 'cw'
+    
+    // Autoconnect state
+    let autoConnectInterval = null;
+    let connectionCheckInterval = null;
 
     onMount(() => {
         console.log('=== FRONTEND: App started ===');
@@ -56,12 +60,147 @@
 
         document.addEventListener('pointerdown', handleGlobalPointerDown);
         document.addEventListener('keydown', handleGlobalKeydown);
+        
+        // Start autoconnect interval
+        startAutoConnect();
 
         return () => {
             document.removeEventListener('pointerdown', handleGlobalPointerDown);
             document.removeEventListener('keydown', handleGlobalKeydown);
+            stopAutoConnect();
+            stopConnectionCheck();
         };
     });
+    
+    function startAutoConnect() {
+        if (autoConnectInterval) return;
+        
+        // Try to connect immediately
+        tryAutoConnect();
+        
+        // Then try every 1 second
+        autoConnectInterval = setInterval(() => {
+            if (!isConnected && !loading) {
+                tryAutoConnect();
+            }
+        }, 1000);
+    }
+    
+    function stopAutoConnect() {
+        if (autoConnectInterval) {
+            clearInterval(autoConnectInterval);
+            autoConnectInterval = null;
+        }
+    }
+    
+    function startConnectionCheck() {
+        if (connectionCheckInterval) return;
+        
+        // Check connection every 2 seconds
+        connectionCheckInterval = setInterval(() => {
+            if (isConnected) {
+                checkConnection();
+            }
+        }, 2000);
+    }
+    
+    function stopConnectionCheck() {
+        if (connectionCheckInterval) {
+            clearInterval(connectionCheckInterval);
+            connectionCheckInterval = null;
+        }
+    }
+    
+    async function tryAutoConnect() {
+        try {
+            console.log('Attempting auto-connect...');
+            const result = await invoke('simple_connect');
+            
+            isConnected = true;
+            connectionStatus = 'connected';
+            deviceInfo = result.device_info;
+            keymap = result.keymap || [];
+            encoders = result.encoders || [];
+            boardLayout = result.layout ?? null;
+            dataLoaded = true;
+
+            if (!boardLayout) {
+                try {
+                    boardLayout = await invoke('get_board_layout');
+                } catch (layoutError) {
+                    console.warn('Failed to fetch board layout metadata:', layoutError);
+                }
+            }
+            activeEncoderMenu = null;
+
+            console.log('Auto-connected successfully:', result);
+            
+            // Only load I2C devices if this is a Master device (device_type = 1)
+            if (deviceInfo.device_type === 1) {
+                loadingI2CDevices = true;
+                try {
+                    i2cDevices = await invoke('get_i2c_devices');
+                    console.log('I2C devices loaded:', i2cDevices);
+                } catch (e) {
+                    console.error('Failed to load I2C devices:', e);
+                } finally {
+                    loadingI2CDevices = false;
+                }
+            } else {
+                console.log('Connected to slave device - no I2C slaves to query');
+                i2cDevices = [];
+            }
+            
+            slaveKeymaps = {};
+            slaveEncoders = {};
+            storeOriginalData();
+            
+            // Start monitoring connection
+            startConnectionCheck();
+            
+            // Clear any previous errors
+            error = null;
+        } catch (e) {
+            // Silent fail for autoconnect - don't show errors
+            console.log('Auto-connect attempt failed (this is normal if no device is connected)');
+        }
+    }
+    
+    async function checkConnection() {
+        try {
+            // Try a lightweight operation to check if device is still connected
+            await invoke('get_board_layout');
+        } catch (e) {
+            console.log('Device disconnected, cleaning up...');
+            handleDisconnection();
+        }
+    }
+    
+    function handleDisconnection() {
+        isConnected = false;
+        connectionStatus = 'disconnected';
+        deviceInfo = null;
+        keymap = [];
+        encoders = [];
+        slaveKeymaps = {};
+        slaveEncoders = {};
+        boardLayout = null;
+        selectedKey = null;
+        selectedEncoder = null;
+        activeEncoderMenu = null;
+        originalKeymap = [];
+        originalEncoders = [];
+        originalSlaveKeymaps = {};
+        originalSlaveEncoders = {};
+        dataLoaded = false;
+        hasChanges = false;
+        showSavePopup = false;
+        i2cDevices = [];
+        
+        stopConnectionCheck();
+        
+        console.log('Device disconnected, will attempt to reconnect...');
+    }
 
     // Load keycodes from backend
     async function loadKeycodes() {
@@ -97,74 +236,9 @@
     }
 
     async function connectDevice() {
-        loading = true;
-        error = null;
-        
-        try {
-            console.log('Connecting to device...');
-            const result = await invoke('simple_connect');
-            
-            isConnected = true;
-            connectionStatus = 'connected';
-            deviceInfo = result.device_info;
-            keymap = result.keymap || [];
-            encoders = result.encoders || [];
-            boardLayout = result.layout ?? null;
-            dataLoaded = true;
-
-            if (!boardLayout) {
-                try {
-                    boardLayout = await invoke('get_board_layout');
-                } catch (layoutError) {
-                    console.warn('Failed to fetch board layout metadata:', layoutError);
-                }
-            }
-            activeEncoderMenu = null;
-
-            console.log('Loaded layout metadata:', boardLayout);
-            
-            // Only load I2C devices if this is a Master device (device_type = 1)
-            // Slave devices (device_type = 0) don't have slave devices to query
-            if (deviceInfo.device_type === 1) {
-                loadingI2CDevices = true;
-                try {
-                    i2cDevices = await invoke('get_i2c_devices');
-                    console.log('I2C devices loaded:', i2cDevices);
-                    
-                    // Don't load slave keymaps on initial connection - load on-demand when selected
-                    // This makes the initial connection faster
-                } catch (e) {
-                    console.error('Failed to load I2C devices:', e);
-                } finally {
-                    loadingI2CDevices = false;
-                }
-            } else {
-                console.log('Connected to slave device - no I2C slaves to query');
-                i2cDevices = [];
-            }
-            
-            slaveKeymaps = {};
-            slaveEncoders = {};
-            storeOriginalData();
-            
-            console.log('Connected successfully:', result);
-        } catch (e) {
-            error = `Failed to connect: ${e}`;
-            console.error('Connection failed:', e);
-            
-            isConnected = false;
-            connectionStatus = 'disconnected';
-            deviceInfo = null;
-            keymap = [];
-            encoders = [];
-            i2cDevices = [];
-            slaveKeymaps = {};
-            boardLayout = null;
-            activeEncoderMenu = null;
-            dataLoaded = false;
-        }
-        
-        loading = false;
+        // This function is now just for manual reconnect if needed
+        // The autoconnect will handle most connections
+        await tryAutoConnect();
     }
 
     async function disconnectDevice() {
@@ -172,28 +246,9 @@
         error = null;
         
         try {
-            console.log('Disconnecting from device...');
+            console.log('Manually disconnecting from device...');
             await invoke('simple_disconnect');
-            
-            isConnected = false;
-            connectionStatus = 'disconnected';
-            deviceInfo = null;
-            keymap = [];
-            encoders = [];
-            slaveKeymaps = {};
-            slaveEncoders = {};
-            boardLayout = null;
-            selectedKey = null;
-            selectedEncoder = null;
-            activeEncoderMenu = null;
-            originalKeymap = [];
-            originalEncoders = [];
-            originalSlaveKeymaps = {};
-            originalSlaveEncoders = {};
-            dataLoaded = false;
-            hasChanges = false;
-            showSavePopup = false;
-            
+            handleDisconnection();
             console.log('Disconnected successfully');
         } catch (e) {
             error = `Failed to disconnect: ${e}`;
@@ -729,6 +784,22 @@
 <main class="app">
     <div class="app-background"></div>
     
+    {#if !isConnected}
+        <div class="fullscreen-loading">
+            <div class="loading-content">
+                <div class="logo-large">
+                    <svg width="64" height="64" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <path d="M3 7H21L19 2H5L3 7Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        <path d="M3 7L5 22H19L21 7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        <path d="M9 12H15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                    </svg>
+                </div>
+                <div class="spinner-large"></div>
+                <h2>Searching for device...</h2>
+                <p>Please connect your keyboard</p>
+            </div>
+        </div>
+    {:else}
     <div class="container">
     <header class="header">
             <div class="header-content">
@@ -740,7 +811,7 @@
                             <path d="M9 12H15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
                         </svg>
                     </div>
-                    <h1 class="title">Keyboard Configurator</h1>
+                    <h1 class="title">openGRADER Configurator</h1>
                 </div>
                 
                 <div class="connection-status">
@@ -777,58 +848,7 @@
                 </button>
             </div>
         {/if}
-
-    <div class="glass-card connection-card">
-            <div class="connection-layout">
-                <div class="connection-action">
-                    {#if !isConnected}
-                        <button class="primary-button" onclick={connectDevice} disabled={loading}>
-                            {#if loading}
-                                <div class="spinner"></div>
-                                <span>Connecting...</span>
-                            {:else}
-                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                    <path d="M13 2L3 14H12L11 22L21 10H12L13 2Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                                </svg>
-                                <span>Connect Device</span>
-                            {/if}
-                        </button>
-                    {:else}
-                        <button class="secondary-button" onclick={disconnectDevice} disabled={loading}>
-                            {#if loading}
-                                <div class="spinner"></div>
-                                <span>Disconnecting...</span>
-                            {:else}
-                                <span>Disconnect Device</span>
-                            {/if}
-                        </button>
-                    {/if}
-                </div>
-
-                {#if deviceInfo}
-                    <div class="device-info-compact">
-                        <div class="info-chip">
-                            <span class="info-label">Device:</span>
-                            <span class="info-value">{deviceInfo.device_name}</span>
-                        </div>
-                        <div class="info-chip">
-                            <span class="info-label">FW:</span>
-                            <span class="info-value">{deviceInfo.firmware_version_major}.{deviceInfo.firmware_version_minor}.{deviceInfo.firmware_version_patch}</span>
-                        </div>
-                        <div class="info-chip">
-                            <span class="info-label">Matrix:</span>
-                            <span class="info-value">{deviceInfo.matrix_rows}×{deviceInfo.matrix_cols}</span>
-                        </div>
-                        <div class="info-chip">
-                            <span class="info-label">Encoders:</span>
-                            <span class="info-value">{deviceInfo.encoder_count}</span>
-                        </div>
-                    </div>
-                {/if}
-            </div>
-        </div>
-
-        {#if isConnected}
+{#if isConnected}
             <div class="device-card-grid" role="tablist" aria-label="Device selection">
                 <button
                     class="device-card"
@@ -865,30 +885,44 @@
                 {/each}
             </div>
         {/if}
+    <!--
+    <div class="glass-card connection-card">
+            <div class="connection-layout">
+                {#if !isConnected}
+                    <div class="autoconnect-status">
+                        <div class="spinner-small"></div>
+                        <span>Searching for device...</span>
+                    </div>
+                {/if}
 
-        <nav class="tab-nav">
-            <button 
-                class="tab-button"
-                class:active={selectedTab === 'keymap'}
-                onclick={() => selectedTab = 'keymap'}
-                disabled={!isConnected}
-                aria-label="Keymap Tab"
-            >
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                    <rect x="2" y="6" width="20" height="12" rx="2" stroke="currentColor" stroke-width="2"/>
-                    <path d="M6 10H8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-                    <path d="M10 10H12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-                    <path d="M14 10H16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-                    <path d="M6 14H10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-                    <path d="M12 14H16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-                </svg>
-                <span>Keymap</span>
-            </button>
-        </nav>
+                {#if deviceInfo}
+                    <div class="device-info-compact">
+                        <div class="info-chip">
+                            <span class="info-label">Device:</span>
+                            <span class="info-value">{deviceInfo.device_name}</span>
+                        </div>
+                        <div class="info-chip">
+                            <span class="info-label">FW:</span>
+                            <span class="info-value">{deviceInfo.firmware_version_major}.{deviceInfo.firmware_version_minor}.{deviceInfo.firmware_version_patch}</span>
+                        </div>
+                        <div class="info-chip">
+                            <span class="info-label">Matrix:</span>
+                            <span class="info-value">{deviceInfo.matrix_rows}×{deviceInfo.matrix_cols}</span>
+                        </div>
+                        <div class="info-chip">
+                            <span class="info-label">Encoders:</span>
+                            <span class="info-value">{deviceInfo.encoder_count}</span>
+                        </div>
+                    </div>
+                {/if}
+            </div>
+        </div>
+    -->
 
-        <div class="tab-content">
-            {#if selectedTab === 'keymap'}
-                <div class="glass-card keymap-card">
+        
+
+        {#if isConnected}
+                <div class="glass-card keymap-card" class:has-active-menu={activeEncoderMenu !== null}>
                     <div class="card-header">
                         <h2>Keymap Configuration</h2>
                         <p>Click on any key to customize its function</p>
@@ -897,7 +931,7 @@
                     {#if loadingKeymap}
                         <div class="loading-state">
                             <div class="spinner-large"></div>
-                            <h3>Loading Keymap...</h3>
+                            <h3>Loading Keymap...</h3>000
                             <p>{selectedDevice === 'main' ? 'Fetching key configuration from device' : `Loading keymap from slave device 0x${parseInt(selectedDevice, 10).toString(16).toUpperCase()}`}</p>
                         </div>
                     {:else if (selectedDevice === 'main' && keymap.length > 0) || (selectedDevice !== 'main' && slaveKeymaps[selectedDevice] && slaveKeymaps[selectedDevice].length > 0)}
@@ -911,7 +945,7 @@
                                 {#each getCurrentKeymap() as row, rowIndex}
                                     <div class="keymap-row">
                                         {#each row as key, colIndex}
-                                            <div class={`keymap-cell ${isEncoderCell(rowIndex, colIndex) ? 'encoder-cell' : ''}`}>
+                                            <div class={`keymap-cell ${isEncoderCell(rowIndex, colIndex) ? 'encoder-cell' : ''} ${activeEncoderMenu && activeEncoderMenu.row === rowIndex && activeEncoderMenu.col === colIndex ? 'active-encoder' : ''}`}>
                                                 {#if isEncoderCell(rowIndex, colIndex)}
                                                     <button
                                                         class="key encoder-key"
@@ -919,7 +953,6 @@
                                                         onclick={(event) => toggleEncoderMenu(rowIndex, colIndex, event)}
                                                         aria-label={`Encoder ${encoderIdForCell(rowIndex, colIndex) ?? ''} at R${rowIndex}C${colIndex}`}
                                                     >
-                                                        <span class="encoder-id">{encoderIdForCell(rowIndex, colIndex) ?? '—'}</span>
                                                         {#if key}
                                                             {#each formatKeyLabel(key.keycode) as line}
                                                                 <div class="key-label">{line}</div>
@@ -927,18 +960,46 @@
                                                         {/if}
                                                     </button>
                                                     <div class={`encoder-menu ${activeEncoderMenu && activeEncoderMenu.row === rowIndex && activeEncoderMenu.col === colIndex ? 'active' : ''}`}>
-                                                        <button class="encoder-action ccw" onclick={(event) => handleEncoderAction(rowIndex, colIndex, 'ccw', event)}>
-                                                            <span class="encoder-action-icon">⟲</span>
-                                                            <span class="encoder-action-label">CCW</span>
-                                                        </button>
-                                                        <button class="encoder-action press" onclick={(event) => handleEncoderAction(rowIndex, colIndex, 'press', event)}>
-                                                            <span class="encoder-action-icon">●</span>
-                                                            <span class="encoder-action-label">Press</span>
-                                                        </button>
-                                                        <button class="encoder-action cw" onclick={(event) => handleEncoderAction(rowIndex, colIndex, 'cw', event)}>
-                                                            <span class="encoder-action-icon">⟳</span>
-                                                            <span class="encoder-action-label">CW</span>
-                                                        </button>
+                                                        {#if activeEncoderMenu && activeEncoderMenu.row === rowIndex && activeEncoderMenu.col === colIndex}
+                                                            {@const encoderId = encoderIdForCell(rowIndex, colIndex)}
+                                                            {@const encoderEntry = getEncoderEntryById(encoderId)}
+                                                            <button class="encoder-action ccw" onclick={(event) => handleEncoderAction(rowIndex, colIndex, 'ccw', event)}>
+                                                                <div class="encoder-action-header">
+                                                                    <span class="encoder-action-icon">⟲</span>
+                                                                    <span class="encoder-action-label">CCW</span>
+                                                                </div>
+                                                                <div class="encoder-action-preview">
+                                                                    {#each formatKeyLabel(encoderEntry?.ccw_keycode ?? 0) as line}
+                                                                        <div class="preview-line">{line}</div>
+                                                                    {/each}
+                                                                </div>
+                                                            </button>
+                                                            <button class="encoder-action press" onclick={(event) => handleEncoderAction(rowIndex, colIndex, 'press', event)}>
+                                                                <div class="encoder-action-header">
+                                                                    <svg class="encoder-action-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                                                        <path d="M9 3V6H4V9L12 17L20 9V6H15V3H9Z" fill="currentColor"/>
+                                                                        <path d="M12 17L6 20V22H18V20L12 17Z" fill="currentColor" opacity="0.6"/>
+                                                                    </svg>
+                                                                    <span class="encoder-action-label">Press</span>
+                                                                </div>
+                                                                <div class="encoder-action-preview">
+                                                                    {#each formatKeyLabel(key?.keycode ?? 0) as line}
+                                                                        <div class="preview-line">{line}</div>
+                                                                    {/each}
+                                                                </div>
+                                                            </button>
+                                                            <button class="encoder-action cw" onclick={(event) => handleEncoderAction(rowIndex, colIndex, 'cw', event)}>
+                                                                <div class="encoder-action-header">
+                                                                    <span class="encoder-action-icon">⟳</span>
+                                                                    <span class="encoder-action-label">CW</span>
+                                                                </div>
+                                                                <div class="encoder-action-preview">
+                                                                    {#each formatKeyLabel(encoderEntry?.cw_keycode ?? 0) as line}
+                                                                        <div class="preview-line">{line}</div>
+                                                                    {/each}
+                                                                </div>
+                                                            </button>
+                                                        {/if}
                                                     </div>
                                                 {:else}
                                                     <button
@@ -977,60 +1038,8 @@
                     {/if}
                 </div>
             {/if}
-            {#if selectedTab === 'config'}
-                <div class="glass-card config-card">
-                    <div class="card-header">
-                        <h2>Configuration Management</h2>
-                        <p>Save, load, or reset your keyboard configuration</p>
-                    </div>
-                    
-                    <div class="config-actions">
-                        <button class="primary-button" onclick={saveConfig} disabled={loading}>
-                            {#if loading}
-                                <div class="spinner"></div>
-                            {:else}
-                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                    <path d="M19 21H5A2 2 0 0 1 3 19V5A2 2 0 0 1 5 3H16L21 8V19A2 2 0 0 1 19 21Z" stroke="currentColor" stroke-width="2"/>
-                                    <polyline points="17,21 17,13 7,13 7,21" stroke="currentColor" stroke-width="2"/>
-                                    <polyline points="7,3 7,8 15,8" stroke="currentColor" stroke-width="2"/>
-                                </svg>
-                            {/if}
-                            <span>{loading ? 'Saving...' : 'Save to EEPROM'}</span>
-                        </button>
-                        
-                        <button class="secondary-button" onclick={loadConfig} disabled={loading}>
-                            {#if loading}
-                                <div class="spinner"></div>
-                            {:else}
-                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                    <path d="M14 2H6A2 2 0 0 0 4 4V20A2 2 0 0 0 6 22H18A2 2 0 0 0 20 20V8L14 2Z" stroke="currentColor" stroke-width="2"/>
-                                    <polyline points="14,2 14,8 20,8" stroke="currentColor" stroke-width="2"/>
-                                    <line x1="16" y1="13" x2="8" y2="13" stroke="currentColor" stroke-width="2"/>
-                                    <line x1="16" y1="17" x2="8" y2="17" stroke="currentColor" stroke-width="2"/>
-                                    <polyline points="10,9 9,9 8,9" stroke="currentColor" stroke-width="2"/>
-                                </svg>
-                            {/if}
-                            <span>{loading ? 'Loading...' : 'Load from EEPROM'}</span>
-                        </button>
-                        
-                        <button class="danger-button" onclick={resetConfig} disabled={loading}>
-                            {#if loading}
-                                <div class="spinner"></div>
-                            {:else}
-                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                    <polyline points="1,4 1,10 7,10" stroke="currentColor" stroke-width="2"/>
-                                    <path d="M3.51 15A9 9 0 1 0 6 5.64L1 10" stroke="currentColor" stroke-width="2"/>
-                                </svg>
-                            {/if}
-                            <span>{loading ? 'Resetting...' : 'Reset to Defaults'}</span>
-                        </button>
-                    </div>
-                    
-                 
-                </div>
-            {/if}
-        </div>
     </div>
+    {/if}
 
     {#if showKeyModal && modalKey}
         <div 
@@ -1304,9 +1313,9 @@
     :global(body) {
         margin: 0;
         padding: 0;
-        font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-        background: #0a0a0a;
-        color: #ffffff;
+        font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', 'Segoe UI', Roboto, sans-serif;
+        background: #f5f5f7;
+        color: #1d1d1f;
         overflow-x: hidden;
     }
 
@@ -1323,11 +1332,62 @@
         right: 0;
         bottom: 0;
         background: 
-            radial-gradient(circle at 20% 80%, rgba(120, 119, 198, 0.3) 0%, transparent 50%),
-            radial-gradient(circle at 80% 20%, rgba(255, 119, 198, 0.15) 0%, transparent 50%),
-            radial-gradient(circle at 40% 40%, rgba(120, 219, 255, 0.1) 0%, transparent 50%),
-            linear-gradient(135deg, #0a0a0a 0%, #111111 100%);
+            radial-gradient(circle at 20% 80%, rgba(120, 119, 198, 0.04) 0%, transparent 50%),
+            radial-gradient(circle at 80% 20%, rgba(255, 119, 198, 0.03) 0%, transparent 50%),
+            radial-gradient(circle at 40% 40%, rgba(120, 219, 255, 0.02) 0%, transparent 50%),
+            linear-gradient(135deg, #f5f5f7 0%, #fafafa 100%);
         z-index: -1;
+    }
+    
+    /* Fullscreen Loading Overlay */
+    .fullscreen-loading {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        width: 100vw;
+        height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #f5f5f7;
+        z-index: 9999;
+    }
+    
+    .loading-content {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 24px;
+        text-align: center;
+    }
+    
+    .logo-large {
+        width: 80px;
+        height: 80px;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        border-radius: 20px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: white;
+        box-shadow: 0 8px 32px rgba(102, 126, 234, 0.3);
+    }
+    
+    .loading-content h2 {
+        font-size: 24px;
+        font-weight: 600;
+        color: #1d1d1f;
+        margin: 0;
+        letter-spacing: -0.5px;
+    }
+    
+    .loading-content p {
+        font-size: 16px;
+        color: #86868b;
+        margin: 0;
     }
 
     .container {
@@ -1369,12 +1429,10 @@
 
     .title {
         font-size: 28px;
-        font-weight: 700;
+        font-weight: 600;
         margin: 0;
-        background: linear-gradient(135deg, #ffffff 0%, #a0a0a0 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        background-clip: text;
+        color: #1d1d1f;
+        letter-spacing: -0.5px;
     }
 
     .connection-status {
@@ -1390,20 +1448,20 @@
         border-radius: 20px;
         font-size: 14px;
         font-weight: 500;
-        backdrop-filter: blur(10px);
-        border: 1px solid rgba(255, 255, 255, 0.1);
+        backdrop-filter: blur(20px);
+        border: 1px solid rgba(0, 0, 0, 0.08);
     }
 
     .status-indicator.connected {
-        background: rgba(34, 197, 94, 0.1);
-        color: #22c55e;
-        border-color: rgba(34, 197, 94, 0.2);
+        background: rgba(52, 199, 89, 0.12);
+        color: #28a745;
+        border-color: rgba(52, 199, 89, 0.2);
     }
 
     .status-indicator.disconnected {
-        background: rgba(239, 68, 68, 0.1);
-        color: #ef4444;
-        border-color: rgba(239, 68, 68, 0.2);
+        background: rgba(255, 59, 48, 0.12);
+        color: #ff3b30;
+        border-color: rgba(255, 59, 48, 0.2);
     }
 
     .status-dot {
@@ -1421,15 +1479,15 @@
 
     /* Glass Cards */
     .glass-card {
-        background: rgba(255, 255, 255, 0.05);
-        backdrop-filter: blur(20px);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        border-radius: 16px;
+        background: #fbfbff;
+        backdrop-filter: blur(30px) saturate(180%);
+        border: 1px solid rgba(0, 0, 0, 0.08);
+        border-radius: 20px;
         padding: 24px;
         margin-bottom: 24px;
         box-shadow: 
-            0 8px 32px rgba(0, 0, 0, 0.3),
-            inset 0 1px 0 rgba(255, 255, 255, 0.1);
+            0 4px 16px rgba(0, 0, 0, 0.04),
+            0 1px 3px rgba(0, 0, 0, 0.08);
     }
 
     .card-header {
@@ -1440,12 +1498,13 @@
         font-size: 20px;
         font-weight: 600;
         margin: 0 0 4px 0;
-        color: #ffffff;
+        color: #1d1d1f;
+        letter-spacing: -0.3px;
     }
 
     .card-header p {
         margin: 0;
-        color: #a0a0a0;
+        color: #86868b;
         font-size: 14px;
     }
 
@@ -1459,6 +1518,28 @@
 
     .connection-action {
         flex-shrink: 0;
+    }
+    
+    .autoconnect-status {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 8px 16px;
+        background: rgba(0, 0, 0, 0.03);
+        border: 1px solid rgba(0, 0, 0, 0.08);
+        border-radius: 12px;
+        font-size: 14px;
+        color: #86868b;
+        font-weight: 500;
+    }
+    
+    .spinner-small {
+        width: 16px;
+        height: 16px;
+        border: 2px solid rgba(0, 0, 0, 0.1);
+        border-top: 2px solid #007aff;
+        border-radius: 50%;
+        animation: spin 1s linear infinite;
     }
 
     /* Compact Device Info */
@@ -1474,122 +1555,125 @@
         align-items: center;
         gap: 6px;
         padding: 8px 12px;
-        background: rgba(255, 255, 255, 0.05);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        border-radius: 8px;
+        background: rgba(0, 0, 0, 0.03);
+        border: 1px solid rgba(0, 0, 0, 0.08);
+        border-radius: 10px;
         font-size: 13px;
     }
 
     .info-chip .info-label {
-        color: #a0a0a0;
+        color: #86868b;
         font-weight: 500;
     }
 
     .info-chip .info-value {
-        color: #ffffff;
+        color: #1d1d1f;
         font-weight: 600;
     }
 
     /* Error Banner */
     .error-banner {
-        background: rgba(239, 68, 68, 0.1);
-        border: 1px solid rgba(239, 68, 68, 0.2);
-        border-radius: 12px;
+        background: rgba(255, 59, 48, 0.08);
+        border: 1px solid rgba(255, 59, 48, 0.15);
+        border-radius: 14px;
         padding: 16px;
         margin-bottom: 24px;
         display: flex;
         justify-content: space-between;
         align-items: center;
-        backdrop-filter: blur(10px);
+        backdrop-filter: blur(20px);
     }
 
     .error-content {
         display: flex;
         align-items: center;
         gap: 12px;
-        color: #ef4444;
+        color: #ff3b30;
         font-size: 14px;
     }
 
     .error-close {
         background: none;
         border: none;
-        color: #ef4444;
+        color: #ff3b30;
         cursor: pointer;
         padding: 4px;
-        border-radius: 4px;
+        border-radius: 8px;
         transition: background-color 0.2s;
     }
 
     .error-close:hover {
-        background: rgba(239, 68, 68, 0.1);
+        background: rgba(255, 59, 48, 0.1);
     }
 
     /* Buttons */
     .primary-button {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        background: #007aff;
         color: white;
         border: none;
-        border-radius: 8px;
+        border-radius: 12px;
         padding: 12px 20px;
-        font-size: 14px;
-        font-weight: 500;
+        font-size: 15px;
+        font-weight: 600;
         cursor: pointer;
         display: flex;
         align-items: center;
         gap: 8px;
         transition: all 0.2s;
-        box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
+        box-shadow: 0 2px 8px rgba(0, 122, 255, 0.15);
+        letter-spacing: -0.2px;
     }
 
     .primary-button:hover:not(:disabled) {
-        transform: translateY(-1px);
-        box-shadow: 0 6px 20px rgba(102, 126, 234, 0.4);
+        background: #0051d5;
+        box-shadow: 0 4px 12px rgba(0, 122, 255, 0.25);
     }
 
     .primary-button:disabled {
-        opacity: 0.5;
+        opacity: 0.4;
         cursor: not-allowed;
         transform: none;
     }
 
     .secondary-button {
-        background: rgba(255, 255, 255, 0.1);
-        color: #ffffff;
-        border: 1px solid rgba(255, 255, 255, 0.2);
-        border-radius: 8px;
+        background: rgba(0, 0, 0, 0.04);
+        color: #007aff;
+        border: 1px solid rgba(0, 0, 0, 0.08);
+        border-radius: 12px;
         padding: 12px 20px;
-        font-size: 14px;
-        font-weight: 500;
+        font-size: 15px;
+        font-weight: 600;
         cursor: pointer;
         transition: all 0.2s;
-        backdrop-filter: blur(10px);
+        backdrop-filter: blur(20px);
+        letter-spacing: -0.2px;
     }
 
     .secondary-button:hover:not(:disabled) {
-        background: rgba(255, 255, 255, 0.15);
-        border-color: rgba(255, 255, 255, 0.3);
+        background: rgba(0, 0, 0, 0.08);
+        border-color: rgba(0, 0, 0, 0.12);
     }
 
     .danger-button {
-        background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+        background: #ff3b30;
         color: white;
         border: none;
-        border-radius: 8px;
+        border-radius: 12px;
         padding: 12px 20px;
-        font-size: 14px;
-        font-weight: 500;
+        font-size: 15px;
+        font-weight: 600;
         cursor: pointer;
         display: flex;
         align-items: center;
         gap: 8px;
         transition: all 0.2s;
-        box-shadow: 0 4px 12px rgba(239, 68, 68, 0.3);
+        box-shadow: 0 2px 8px rgba(255, 59, 48, 0.15);
+        letter-spacing: -0.2px;
     }
 
     .danger-button:hover:not(:disabled) {
-        transform: translateY(-1px);
-        box-shadow: 0 6px 20px rgba(239, 68, 68, 0.4);
+        background: #d32f2f;
+        box-shadow: 0 4px 12px rgba(255, 59, 48, 0.25);
     }
 
     /* Spinner */
@@ -1605,8 +1689,8 @@
     .spinner-large {
         width: 48px;
         height: 48px;
-        border: 3px solid rgba(255, 255, 255, 0.2);
-        border-top: 3px solid #667eea;
+        border: 3px solid rgba(0, 0, 0, 0.1);
+        border-top: 3px solid #007aff;
         border-radius: 50%;
         animation: spin 1s linear infinite;
         margin: 0 auto 16px;
@@ -1627,59 +1711,17 @@
         margin: 0 0 8px 0;
         font-size: 18px;
         font-weight: 600;
-        color: #ffffff;
+        color: #1d1d1f;
+        letter-spacing: -0.3px;
     }
 
     .loading-state p {
         margin: 0;
         font-size: 14px;
-        color: #a0a0a0;
+        color: #86868b;
     }
 
-    /* Tab Navigation */
-    .tab-nav {
-        display: flex;
-        gap: 4px;
-        margin-bottom: 24px;
-        background: rgba(255, 255, 255, 0.05);
-        border-radius: 12px;
-        padding: 4px;
-        backdrop-filter: blur(10px);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-    }
 
-    .tab-button {
-        background: none;
-        border: none;
-        padding: 12px 20px;
-        border-radius: 8px;
-        cursor: pointer;
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        font-size: 14px;
-        font-weight: 500;
-        color: #a0a0a0;
-        transition: all 0.2s;
-        flex: 1;
-        justify-content: center;
-    }
-
-    .tab-button:hover:not(:disabled) {
-        color: #ffffff;
-        background: rgba(255, 255, 255, 0.05);
-    }
-
-    .tab-button.active {
-        background: rgba(255, 255, 255, 0.1);
-        color: #ffffff;
-        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
-    }
-
-    .tab-button:disabled {
-        opacity: 0.3;
-        cursor: not-allowed;
-    }
 
     /* Device selection cards */
     .device-card-grid {
@@ -1690,8 +1732,8 @@
     }
 
     .device-card {
-        background: linear-gradient(135deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.02));
-        border: 1px solid rgba(255, 255, 255, 0.12);
+        background: #ffffff;
+        border: 1px solid rgba(0, 0, 0, 0.08);
         border-radius: 16px;
         padding: 16px;
         width: 200px;
@@ -1699,45 +1741,49 @@
         flex-direction: column;
         gap: 12px;
         align-items: flex-start;
-        color: #ffffff;
+        color: #1d1d1f;
         cursor: pointer;
         transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
         background-origin: border-box;
         outline: none;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
     }
 
     .device-card:hover {
-        transform: translateY(-4px);
-        box-shadow: 0 12px 30px rgba(0, 0, 0, 0.25);
+        transform: translateY(-2px);
+        box-shadow: 0 8px 20px rgba(0, 0, 0, 0.08);
     }
 
     .device-card.active {
-        border-color: rgba(102, 126, 234, 0.8);
-        box-shadow: 0 12px 40px rgba(102, 126, 234, 0.25);
+        border-color: rgba(0, 122, 255, 0.6);
+        box-shadow: 0 8px 24px rgba(0, 122, 255, 0.15);
+        background: rgba(0, 122, 255, 0.04);
     }
 
     .device-card:focus-visible {
-        border-color: rgba(79, 209, 197, 0.9);
-        box-shadow: 0 0 0 3px rgba(79, 209, 197, 0.35);
+        border-color: #007aff;
+        box-shadow: 0 0 0 4px rgba(0, 122, 255, 0.2);
     }
 
     .device-card-image {
         width: 100%;
         height: 96px;
         border-radius: 12px;
-        background: rgba(255, 255, 255, 0.08);
+        background: rgba(0, 0, 0, 0.04);
         display: flex;
         align-items: center;
         justify-content: center;
-        color: rgba(255, 255, 255, 0.6);
-        font-size: 12px;
+        color: #86868b;
+        font-size: 11px;
         text-transform: uppercase;
-        letter-spacing: 1px;
+        letter-spacing: 1.2px;
+        font-weight: 600;
     }
 
     .master-placeholder {
-        background: linear-gradient(135deg, rgba(102, 126, 234, 0.35), rgba(118, 75, 162, 0.35));
+        background: linear-gradient(135deg, rgba(0, 122, 255, 0.12), rgba(88, 86, 214, 0.12));
         position: relative;
+        color: #007aff;
     }
 
     .master-placeholder::after {
@@ -1745,8 +1791,9 @@
     }
 
     .module-placeholder {
-        background: linear-gradient(135deg, rgba(72, 187, 255, 0.25), rgba(79, 209, 197, 0.25));
+        background: linear-gradient(135deg, rgba(52, 199, 89, 0.12), rgba(48, 209, 88, 0.12));
         position: relative;
+        color: #34c759;
     }
 
     .module-placeholder::after {
@@ -1767,7 +1814,7 @@
 
     .device-card-subtitle {
         font-size: 12px;
-        color: rgba(255, 255, 255, 0.65);
+        color: #86868b;
     }
 
     /* Keymap */
@@ -1804,22 +1851,41 @@
         justify-content: center;
     }
 
+    .keymap-card {
+        position: relative;
+        isolation: isolate;
+    }
+
+    .keymap-card.has-active-menu::before {
+        content: '';
+        position: absolute;
+        inset: 0;
+        backdrop-filter: blur(3px);
+        background: rgba(251, 251, 255, 0.3);
+        border-radius: 20px;
+        z-index: 50;
+        pointer-events: none;
+    }
+
     .key {
         width: 100%;
         height: 100%;
         padding: 8px;
-        background: rgba(255, 255, 255, 0.05);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        border-radius: 8px;
+        background: #ffffff;
+        border: 1px solid #d1d1d6;
+        border-radius: 12px;
         cursor: pointer;
         transition: all 0.2s;
         display: flex;
         flex-direction: column;
         justify-content: center;
         align-items: center;
-        backdrop-filter: blur(10px);
         position: relative;
         overflow: hidden;
+        box-shadow: 
+            0 1px 3px rgba(0, 0, 0, 0.04),
+            0 0 0 1px rgba(0, 0, 0, 0.02);
+        color: #000000;
     }
 
     .key::before {
@@ -1829,7 +1895,7 @@
         left: 0;
         right: 0;
         bottom: 0;
-        background: linear-gradient(135deg, rgba(102, 126, 234, 0.1) 0%, rgba(118, 75, 162, 0.1) 100%);
+        background: linear-gradient(135deg, rgba(0, 122, 255, 0.08) 0%, rgba(88, 86, 214, 0.08) 100%);
         opacity: 0;
         transition: opacity 0.2s;
     }
@@ -1839,9 +1905,11 @@
     }
 
     .key:hover {
-        border-color: rgba(102, 126, 234, 0.5);
-        transform: translateY(-2px);
-        box-shadow: 0 4px 12px rgba(102, 126, 234, 0.2);
+        border-color: rgba(0, 122, 255, 0.5);
+        transform: translateY(-1px);
+        box-shadow: 
+            0 4px 12px rgba(0, 122, 255, 0.12),
+            0 0 0 1px rgba(0, 122, 255, 0.2);
     }
 
     .key-label {
@@ -1850,6 +1918,8 @@
         text-align: center;
         position: relative;
         z-index: 1;
+        color: #000000;
+        font-weight: 500;
     }
 
     .encoder-key {
@@ -1857,35 +1927,32 @@
         width: 56px;
         height: 56px;
         padding: 12px;
-        border: 2px solid rgba(255, 255, 255, 0.25);
-        background: radial-gradient(circle at 30% 30%, rgba(255, 255, 255, 0.28) 0%, rgba(102, 126, 234, 0.12) 45%, rgba(118, 75, 162, 0.08) 100%);
-        box-shadow: 0 6px 18px rgba(102, 126, 234, 0.25);
+        border: 1px solid #d1d1d6;
+        background: #ffffff;
+        box-shadow: 
+            0 2px 8px rgba(0, 0, 0, 0.04),
+            0 0 0 1px rgba(0, 0, 0, 0.02);
         gap: 6px;
     }
 
     .encoder-key:hover {
-        border-color: rgba(129, 140, 248, 0.8);
-        box-shadow: 0 10px 24px rgba(102, 126, 234, 0.35);
+        border-color: rgba(0, 122, 255, 0.5);
+        box-shadow: 
+            0 4px 12px rgba(0, 122, 255, 0.12),
+            0 0 0 1px rgba(0, 122, 255, 0.2);
     }
 
     .encoder-key.menu-open {
-        border-color: rgba(129, 140, 248, 0.9);
-        box-shadow: 0 12px 36px rgba(102, 126, 234, 0.45);
-    }
-
-    .encoder-id {
-        font-size: 12px;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.12em;
-        color: rgba(255, 255, 255, 0.8);
-        position: relative;
-        z-index: 1;
+        border-color: rgba(0, 122, 255, 0.6);
+        box-shadow: 
+            0 6px 16px rgba(0, 122, 255, 0.18),
+            0 0 0 1px rgba(0, 122, 255, 0.3);
     }
 
     .encoder-key .key-label {
         font-size: 10px;
-        opacity: 0.85;
+        color: #000000;
+        font-weight: 500;
     }
 
     .keymap-overlay {
@@ -1896,14 +1963,15 @@
         align-items: center;
         justify-content: center;
         gap: 10px;
-        background: rgba(12, 12, 20, 0.68);
-        border-radius: 16px;
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        color: #ffffff;
+        background: rgba(255, 255, 255, 0.9);
+        border-radius: 20px;
+        border: 1px solid rgba(0, 0, 0, 0.08);
+        color: #1d1d1f;
         font-size: 13px;
         font-weight: 500;
         z-index: 5;
         pointer-events: none;
+        backdrop-filter: blur(20px);
     }
 
     .encoder-menu {
@@ -1915,31 +1983,36 @@
         opacity: 0;
         pointer-events: none;
         transition: opacity 0.18s ease;
-        z-index: 3;
+        z-index: 100;
     }
 
     .encoder-menu.active {
         opacity: 1;
+        pointer-events: auto;
     }
 
     .encoder-action {
         position: absolute;
         top: 50%;
         left: 50%;
-        width: 38px;
-        height: 38px;
-        border-radius: 999px;
-        border: 1px solid rgba(255, 255, 255, 0.2);
-        background: linear-gradient(135deg, rgba(102, 126, 234, 0.95), rgba(118, 75, 162, 0.95));
-        color: #ffffff;
+        width: 80px;
+        height: 80px;
+        padding: 12px;
+        border-radius: 16px;
+        border: 1px solid #d1d1d6;
+        background: #ffffff;
+        color: #000000;
         display: flex;
+        flex-direction: column;
         align-items: center;
         justify-content: center;
-        gap: 2px;
+        gap: 6px;
         transform: translate(-50%, -50%) scale(0.45);
         opacity: 0;
         transition: transform 0.28s cubic-bezier(0.24, 0.8, 0.25, 1), opacity 0.22s ease;
-        box-shadow: 0 6px 16px rgba(102, 126, 234, 0.35);
+        box-shadow: 
+            0 4px 16px rgba(0, 0, 0, 0.1),
+            0 2px 4px rgba(0, 0, 0, 0.06);
         pointer-events: none;
     }
 
@@ -1950,20 +2023,21 @@
     }
 
     .encoder-action.ccw {
-        --dx: -34px;
-        --dy: -42px;
+        --dx: -95px;
+        --dy: -70px;
     }
 
     .encoder-action.press {
         --dx: 0px;
-        --dy: -58px;
-        background: linear-gradient(135deg, rgba(255, 255, 255, 0.3), rgba(129, 140, 248, 0.95));
-        color: #0f172a;
+        --dy: -100px;
+        background: #ffffff;
+        color: #000000;
+        border-color: #d1d1d6;
     }
 
     .encoder-action.cw {
-        --dx: 34px;
-        --dy: -42px;
+        --dx: 95px;
+        --dy: -70px;
     }
 
     .encoder-menu.active .encoder-action.ccw { transition-delay: 0.02s; }
@@ -1972,30 +2046,49 @@
 
     .encoder-action:hover {
         transform: translate(calc(-50% + var(--dx, 0px)), calc(-50% + var(--dy, -48px))) scale(1.05);
-        box-shadow: 0 10px 24px rgba(102, 126, 234, 0.45);
+        box-shadow: 
+            0 8px 24px rgba(0, 0, 0, 0.15),
+            0 4px 8px rgba(0, 0, 0, 0.08);
+        border-color: rgba(0, 122, 255, 0.5);
+    }
+
+    .encoder-action-header {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        margin-bottom: 2px;
     }
 
     .encoder-action-icon {
-        font-size: 14px;
+        font-size: 20px;
         line-height: 1;
+        color: #007aff;
     }
 
     .encoder-action-label {
-        position: absolute;
-        top: calc(100% + 4px);
-        left: 50%;
-        transform: translateX(-50%);
         font-size: 10px;
         font-weight: 600;
         letter-spacing: 0.08em;
         text-transform: uppercase;
-        color: rgba(255, 255, 255, 0.85);
+        color: #86868b;
         white-space: nowrap;
-        pointer-events: none;
     }
 
-    .encoder-action.press .encoder-action-label {
-        color: rgba(15, 23, 42, 0.85);
+    .encoder-action-preview {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 2px;
+        font-size: 11px;
+        line-height: 1.2;
+        color: #000000;
+        font-weight: 600;
+        text-align: center;
+        min-height: 22px;
+    }
+
+    .encoder-action-preview .preview-line {
+        white-space: nowrap;
     }
 
     .keymap-container .spinner-small {
@@ -2030,19 +2123,20 @@
     .empty-state {
         text-align: center;
         padding: 48px 24px;
-        color: #a0a0a0;
+        color: #86868b;
     }
 
     .empty-state svg {
         margin-bottom: 16px;
-        opacity: 0.5;
+        opacity: 0.3;
     }
 
     .empty-state h3 {
         margin: 0 0 8px 0;
         font-size: 18px;
         font-weight: 600;
-        color: #ffffff;
+        color: #1d1d1f;
+        letter-spacing: -0.3px;
     }
 
     .empty-state p {
@@ -2057,8 +2151,8 @@
         left: 0;
         right: 0;
         bottom: 0;
-        background: rgba(0, 0, 0, 0.7);
-        backdrop-filter: blur(4px);
+        background: rgba(0, 0, 0, 0.4);
+        backdrop-filter: blur(10px);
         display: flex;
         align-items: center;
         justify-content: center;
@@ -2067,16 +2161,18 @@
     }
 
     .modal-content {
-        background: rgba(20, 20, 20, 0.95);
-        backdrop-filter: blur(20px);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        border-radius: 16px;
+        background: rgba(255, 255, 255, 0.95);
+        backdrop-filter: blur(30px) saturate(180%);
+        border: 1px solid rgba(0, 0, 0, 0.08);
+        border-radius: 20px;
         width: 100%;
         max-width: 700px;
         max-height: 80vh;
         display: flex;
         flex-direction: column;
-        box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+        box-shadow: 
+            0 20px 60px rgba(0, 0, 0, 0.15),
+            0 8px 24px rgba(0, 0, 0, 0.08);
     }
 
     .modal-header {
@@ -2084,58 +2180,59 @@
         justify-content: space-between;
         align-items: center;
         padding: 24px;
-        border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        border-bottom: 1px solid rgba(0, 0, 0, 0.08);
     }
 
     .modal-header h3 {
         margin: 0;
         font-size: 18px;
         font-weight: 600;
-        color: #ffffff;
+        color: #1d1d1f;
+        letter-spacing: -0.3px;
     }
 
     .modal-close {
         background: none;
         border: none;
-        color: #a0a0a0;
+        color: #86868b;
         cursor: pointer;
         padding: 4px;
-        border-radius: 4px;
+        border-radius: 8px;
         transition: all 0.2s;
     }
 
     .modal-close:hover {
-        background: rgba(255, 255, 255, 0.1);
-        color: #ffffff;
+        background: rgba(0, 0, 0, 0.05);
+        color: #1d1d1f;
     }
 
     .modal-tabs {
         display: flex;
-        gap: 4px;
+        gap: 8px;
         padding: 16px 24px 0;
-        border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        border-bottom: 1px solid rgba(0, 0, 0, 0.08);
     }
 
     .modal-tab {
         background: none;
         border: none;
-        padding: 12px 20px;
-        border-radius: 8px 8px 0 0;
+        padding: 10px 20px;
+        border-radius: 10px 10px 0 0;
         cursor: pointer;
         font-size: 14px;
         font-weight: 500;
-        color: #a0a0a0;
+        color: #86868b;
         transition: all 0.2s;
     }
 
     .modal-tab:hover {
-        color: #ffffff;
-        background: rgba(255, 255, 255, 0.05);
+        color: #1d1d1f;
+        background: rgba(0, 0, 0, 0.03);
     }
 
     .modal-tab.active {
-        background: rgba(255, 255, 255, 0.1);
-        color: #ffffff;
+        background: rgba(0, 122, 255, 0.08);
+        color: #007aff;
     }
 
     .modal-body {
@@ -2159,9 +2256,9 @@
     .category-title {
         font-size: 13px;
         font-weight: 600;
-        color: #a0a0a0;
+        color: #86868b;
         text-transform: uppercase;
-        letter-spacing: 0.5px;
+        letter-spacing: 0.8px;
         margin: 0;
     }
 
@@ -2173,25 +2270,27 @@
 
     .keycode-option {
         padding: 12px;
-        background: rgba(255, 255, 255, 0.05);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        border-radius: 8px;
+        background: rgba(0, 0, 0, 0.03);
+        border: 1px solid rgba(0, 0, 0, 0.08);
+        border-radius: 10px;
         cursor: pointer;
         font-size: 13px;
-        color: #ffffff;
+        color: #1d1d1f;
         transition: all 0.2s;
         text-align: center;
+        font-weight: 500;
     }
 
     .keycode-option:hover {
-        background: rgba(255, 255, 255, 0.1);
-        border-color: rgba(102, 126, 234, 0.5);
+        background: rgba(0, 0, 0, 0.05);
+        border-color: rgba(0, 122, 255, 0.3);
     }
 
     .keycode-option.selected {
-        background: rgba(102, 126, 234, 0.2);
-        border-color: #667eea;
-        box-shadow: 0 0 0 2px rgba(102, 126, 234, 0.3);
+        background: rgba(0, 122, 255, 0.12);
+        border-color: #007aff;
+        color: #007aff;
+        box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.15);
     }
 
     .midi-config {
