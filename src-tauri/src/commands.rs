@@ -1,5 +1,5 @@
 use crate::hid_manager::{HidManager, DeviceDescriptor};
-use crate::protocol::{DeviceInfo, KeymapEntry, EncoderEntry, I2CDeviceInfo, SlaveKeymapEntry, SlaveEncoderEntry, BoardLayoutInfo};
+use crate::protocol::{DeviceInfo, KeymapEntry, EncoderEntry, I2CDeviceInfo, SlaveKeymapEntry, SlaveEncoderEntry, BoardLayoutInfo, LayerState};
 use std::sync::Arc;
 use tauri::{AppHandle, State, Emitter};
 use tokio::sync::RwLock;
@@ -197,65 +197,10 @@ pub async fn simple_connect(state: State<'_, AppState>) -> Result<FullState, Str
             }
         }
     };
-    
-    // Step 4: Load keymap
-    println!("simple_connect: loading keymap...");
-    let keymap = {
-        let manager = state.read().await;
-        let mut keymap = Vec::new();
-        let mut total_keys = 0;
-        let mut failed_keys = 0;
-        
-        for row in 0..device_info.matrix_rows {
-            let mut row_entries = Vec::new();
-            for col in 0..device_info.matrix_cols {
-                total_keys += 1;
-                match manager.get_keymap_entry(row, col).await {
-                    Ok(entry) => {
-                        row_entries.push(entry);
-                        if total_keys % 10 == 0 {
-                            println!("simple_connect: loaded keymap entries: {}/{}", total_keys, device_info.matrix_rows * device_info.matrix_cols);
-                        }
-                    },
-                    Err(e) => {
-                        failed_keys += 1;
-                        println!("Warning: failed to read keymap entry at {},{}: {}", row, col, e);
-                        row_entries.push(KeymapEntry { row, col, keycode: 0 });
-                    }
-                }
-            }
-            keymap.push(row_entries);
-        }
-        println!("simple_connect: keymap loaded: {} rows, {} total keys, {} failed", keymap.len(), total_keys, failed_keys);
-        keymap
-    };
-    
-    // Step 5: Load encoders
-    println!("simple_connect: loading encoders...");
-    let encoders = {
-        let manager = state.read().await;
-        let mut encoders = Vec::new();
-        let mut failed_encoders = 0;
-        
-        for encoder_id in 0..device_info.encoder_count {
-            match manager.get_encoder_entry(encoder_id).await {
-                Ok(entry) => {
-                    println!("simple_connect: loaded encoder {}: CCW={}, CW={}", encoder_id, entry.ccw_keycode, entry.cw_keycode);
-                    encoders.push(entry);
-                },
-                Err(e) => {
-                    failed_encoders += 1;
-                    println!("Warning: failed to read encoder entry {}: {}", encoder_id, e);
-                    encoders.push(EncoderEntry { encoder_id, ccw_keycode: 0, cw_keycode: 0, reserved: 0 });
-                }
-            }
-        }
-        println!("simple_connect: encoders loaded: {} encoders, {} failed", encoders.len(), failed_encoders);
-        encoders
-    };
-    
+
+    let full_state = build_full_state(&state, device_info, layout).await?;
     println!("simple_connect: all data loaded successfully");
-    Ok(FullState { device_info, keymap, encoders, layout })
+    Ok(full_state)
 }
 
 // Simple disconnect command
@@ -267,51 +212,163 @@ pub async fn simple_disconnect(state: State<'_, AppState>) -> Result<(), String>
     Ok(())
 }
 
+async fn build_full_state(
+    state: &State<'_, AppState>,
+    device_info: DeviceInfo,
+    layout: Option<BoardLayoutInfo>,
+) -> Result<FullState, String> {
+    println!(
+        "build_full_state: snapshotting '{}' (layers={}, rows={} cols={} encoders={})",
+        device_info.device_name,
+        device_info.layer_count,
+        device_info.matrix_rows,
+        device_info.matrix_cols,
+        device_info.encoder_count
+    );
+
+    let layer_state = {
+        let manager = state.read().await;
+        match manager.get_layer_state().await {
+            Ok(state) => Some(state),
+            Err(e) => {
+                println!("build_full_state: layer state unavailable ({})", e);
+                None
+            }
+        }
+    };
+
+    let layer_count = device_info.layer_count.max(1);
+    let matrix_rows = device_info.matrix_rows;
+    let matrix_cols = device_info.matrix_cols;
+    let encoder_count = device_info.encoder_count;
+
+    println!(
+        "build_full_state: loading keymap (layers={}, rows={}, cols={})",
+        layer_count,
+        matrix_rows,
+        matrix_cols
+    );
+    let keymap = {
+        let manager = state.read().await;
+        let mut all_layers = Vec::with_capacity(layer_count as usize);
+        let mut total_entries = 0usize;
+        let mut failed_entries = 0usize;
+
+        for layer_idx in 0..layer_count {
+            let mut layer_rows = Vec::with_capacity(matrix_rows as usize);
+            for row_idx in 0..matrix_rows {
+                let mut row_entries = Vec::with_capacity(matrix_cols as usize);
+                for col_idx in 0..matrix_cols {
+                    total_entries += 1;
+                    match manager.get_keymap_entry(layer_idx, row_idx, col_idx).await {
+                        Ok(entry) => row_entries.push(entry),
+                        Err(e) => {
+                            failed_entries += 1;
+                            println!(
+                                "build_full_state: keymap read failed at L{} R{} C{} -> {}",
+                                layer_idx, row_idx, col_idx, e
+                            );
+                            row_entries.push(KeymapEntry {
+                                layer: layer_idx,
+                                row: row_idx,
+                                col: col_idx,
+                                keycode: 0,
+                            });
+                        }
+                    }
+                }
+                layer_rows.push(row_entries);
+            }
+            all_layers.push(layer_rows);
+        }
+
+        println!(
+            "build_full_state: keymap complete ({} entries, {} failures)",
+            total_entries,
+            failed_entries
+        );
+        all_layers
+    };
+
+    println!(
+        "build_full_state: loading encoders (layers={}, count={})",
+        layer_count,
+        encoder_count
+    );
+    let encoders = {
+        let manager = state.read().await;
+        let mut all_layers = Vec::with_capacity(layer_count as usize);
+        let mut failed_encoders = 0usize;
+
+        for layer_idx in 0..layer_count {
+            let mut layer_encoders = Vec::with_capacity(encoder_count as usize);
+            for encoder_idx in 0..encoder_count {
+                match manager.get_encoder_entry(layer_idx, encoder_idx).await {
+                    Ok(entry) => layer_encoders.push(entry),
+                    Err(e) => {
+                        failed_encoders += 1;
+                        println!(
+                            "build_full_state: encoder read failed at L{} #{} -> {}",
+                            layer_idx, encoder_idx, e
+                        );
+                        layer_encoders.push(EncoderEntry {
+                            layer: layer_idx,
+                            encoder_id: encoder_idx,
+                            ccw_keycode: 0,
+                            cw_keycode: 0,
+                            reserved: 0,
+                        });
+                    }
+                }
+            }
+            all_layers.push(layer_encoders);
+        }
+
+        println!(
+            "build_full_state: encoders complete ({} failures)",
+            failed_encoders
+        );
+        all_layers
+    };
+
+    Ok(FullState {
+        device_info,
+        keymap,
+        encoders,
+        layout,
+        layer_state,
+    })
+}
+
 // Batched full-state loader to avoid multiple interleaved invokes
 #[derive(serde::Serialize)]
 pub struct FullState {
     pub device_info: DeviceInfo,
-    pub keymap: Vec<Vec<KeymapEntry>>,
-    pub encoders: Vec<EncoderEntry>,
+    pub keymap: Vec<Vec<Vec<KeymapEntry>>>,
+    pub encoders: Vec<Vec<EncoderEntry>>,
     pub layout: Option<BoardLayoutInfo>,
+    pub layer_state: Option<LayerState>,
 }
 
 #[tauri::command]
 pub async fn load_full_state(state: State<'_, AppState>) -> Result<FullState, String> {
-    let manager = state.read().await;
-    let device_info = manager.get_device_info().await?;
+    let device_info = {
+        let manager = state.read().await;
+        manager.get_device_info().await?
+    };
 
-    let layout = match manager.get_board_layout().await {
-        Ok(info) => Some(info),
-        Err(e) => {
-            println!("load_full_state: warning - no layout info available: {}", e);
-            None
+    let layout = {
+        let manager = state.read().await;
+        match manager.get_board_layout().await {
+            Ok(info) => Some(info),
+            Err(e) => {
+                println!("load_full_state: warning - no layout info available: {}", e);
+                None
+            }
         }
     };
 
-    // Build keymap
-    let mut keymap = Vec::new();
-    for row in 0..device_info.matrix_rows {
-        let mut row_entries = Vec::new();
-        for col in 0..device_info.matrix_cols {
-            match manager.get_keymap_entry(row, col).await {
-                Ok(entry) => row_entries.push(entry),
-                Err(_) => row_entries.push(KeymapEntry { row, col, keycode: 0 }),
-            }
-        }
-        keymap.push(row_entries);
-    }
-
-    // Build encoders
-    let mut encoders = Vec::new();
-    for encoder_id in 0..device_info.encoder_count {
-        match manager.get_encoder_entry(encoder_id).await {
-            Ok(entry) => encoders.push(entry),
-            Err(_) => encoders.push(EncoderEntry { encoder_id, ccw_keycode: 0, cw_keycode: 0, reserved: 0 }),
-        }
-    }
-
-    Ok(FullState { device_info, keymap, encoders, layout })
+    build_full_state(&state, device_info, layout).await
 }
 
 // Enhanced connection status that includes all data in one call
@@ -319,9 +376,10 @@ pub async fn load_full_state(state: State<'_, AppState>) -> Result<FullState, St
 pub struct EnhancedConnectionStatus {
     pub connected: bool,
     pub device_info: Option<DeviceInfo>,
-    pub keymap: Option<Vec<Vec<KeymapEntry>>>,
-    pub encoders: Option<Vec<EncoderEntry>>,
+    pub keymap: Option<Vec<Vec<Vec<KeymapEntry>>>>,
+    pub encoders: Option<Vec<Vec<EncoderEntry>>>,
     pub layout: Option<BoardLayoutInfo>,
+    pub layer_state: Option<LayerState>,
     pub error: Option<String>,
 }
 
@@ -338,17 +396,17 @@ pub async fn get_enhanced_connection_status(state: State<'_, AppState>) -> Resul
             keymap: None,
             encoders: None,
             layout: None,
+            layer_state: None,
             error: None,
         });
     }
 
-    // Get device info
     println!("Getting device info...");
     let device_info = match manager.get_device_info().await {
         Ok(info) => {
             println!("Device info retrieved: {}", info.device_name);
-            Some(info)
-        },
+            info
+        }
         Err(e) => {
             println!("Failed to get device info: {}", e);
             return Ok(EnhancedConnectionStatus {
@@ -357,54 +415,41 @@ pub async fn get_enhanced_connection_status(state: State<'_, AppState>) -> Resul
                 keymap: None,
                 encoders: None,
                 layout: None,
+                layer_state: None,
                 error: Some(format!("Failed to get device info: {}", e)),
             });
-        },
+        }
     };
+    drop(manager);
 
-    let device_info_ref = device_info.as_ref().unwrap();
-
-    // Build keymap
-    println!("Building keymap: {}x{}", device_info_ref.matrix_rows, device_info_ref.matrix_cols);
-    let mut keymap = Vec::new();
-    for row in 0..device_info_ref.matrix_rows {
-        let mut row_entries = Vec::new();
-        for col in 0..device_info_ref.matrix_cols {
-            match manager.get_keymap_entry(row, col).await {
-                Ok(entry) => row_entries.push(entry),
-                Err(_) => row_entries.push(KeymapEntry { row, col, keycode: 0 }),
+    let layout = {
+        let manager = state.read().await;
+        match manager.get_board_layout().await {
+            Ok(info) => Some(info),
+            Err(e) => {
+                println!("Enhanced connection status: layout unavailable: {}", e);
+                None
             }
         }
-        keymap.push(row_entries);
-    }
-    println!("Keymap built: {} rows", keymap.len());
-
-    // Build encoders
-    println!("Building encoders: {} encoders", device_info_ref.encoder_count);
-    let mut encoders = Vec::new();
-    for encoder_id in 0..device_info_ref.encoder_count {
-        match manager.get_encoder_entry(encoder_id).await {
-            Ok(entry) => encoders.push(entry),
-            Err(_) => encoders.push(EncoderEntry { encoder_id, ccw_keycode: 0, cw_keycode: 0, reserved: 0 }),
-        }
-    }
-    println!("Encoders built: {} encoders", encoders.len());
-
-    let layout = match manager.get_board_layout().await {
-        Ok(info) => Some(info),
-        Err(e) => {
-            println!("Enhanced connection status: layout unavailable: {}", e);
-            None
-        }
     };
+
+    let snapshot = build_full_state(&state, device_info, layout).await?;
+    let FullState {
+        device_info,
+        keymap,
+        encoders,
+        layout,
+        layer_state,
+    } = snapshot;
 
     println!("Enhanced connection status complete: connected=true");
     Ok(EnhancedConnectionStatus {
         connected: true,
-        device_info,
+        device_info: Some(device_info),
         keymap: Some(keymap),
         encoders: Some(encoders),
         layout,
+        layer_state,
         error: None,
     })
 }
@@ -413,12 +458,13 @@ pub async fn get_enhanced_connection_status(state: State<'_, AppState>) -> Resul
 
 #[tauri::command]
 pub async fn get_keymap_entry(
+    layer: u8,
     row: u8,
     col: u8,
     state: State<'_, AppState>,
 ) -> Result<KeymapEntry, String> {
     let manager = state.read().await;
-    manager.get_keymap_entry(row, col).await
+    manager.get_keymap_entry(layer, row, col).await
 }
 
 #[tauri::command]
@@ -431,47 +477,28 @@ pub async fn set_keymap_entry(
 }
 
 #[tauri::command]
-pub async fn get_full_keymap(state: State<'_, AppState>) -> Result<Vec<Vec<KeymapEntry>>, String> {
-    let manager = state.read().await;
-    
-    // Get device info first to know matrix dimensions
-    let device_info = manager.get_device_info().await?;
-    
-    let mut keymap = Vec::new();
-    
-    for row in 0..device_info.matrix_rows {
-        let mut row_entries = Vec::new();
-        
-        for col in 0..device_info.matrix_cols {
-            match manager.get_keymap_entry(row, col).await {
-                Ok(entry) => row_entries.push(entry),
-                Err(_e) => {
-                    // If we can't read a key, create a placeholder
-                    row_entries.push(KeymapEntry {
-                        row,
-                        col,
-                        keycode: 0, // KC_NO
-                    });
-                }
-            }
-        }
-        
-        keymap.push(row_entries);
-    }
-    
-    Ok(keymap)
+pub async fn get_full_keymap(state: State<'_, AppState>) -> Result<Vec<Vec<Vec<KeymapEntry>>>, String> {
+    let device_info = {
+        let manager = state.read().await;
+        manager.get_device_info().await?
+    };
+
+    let snapshot = build_full_state(&state, device_info, None).await?;
+    Ok(snapshot.keymap)
 }
 
 #[tauri::command]
 pub async fn set_full_keymap(
-    keymap: Vec<Vec<KeymapEntry>>,
+    keymap: Vec<Vec<Vec<KeymapEntry>>>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let manager = state.read().await;
     
-    for row_entries in keymap {
-        for entry in row_entries {
-            manager.set_keymap_entry(&entry).await?;
+    for layer_entries in keymap {
+        for row_entries in layer_entries {
+            for entry in row_entries {
+                manager.set_keymap_entry(&entry).await?;
+            }
         }
     }
     
@@ -482,11 +509,12 @@ pub async fn set_full_keymap(
 
 #[tauri::command]
 pub async fn get_encoder_entry(
+    layer: u8,
     encoder_id: u8,
     state: State<'_, AppState>,
 ) -> Result<EncoderEntry, String> {
     let manager = state.read().await;
-    manager.get_encoder_entry(encoder_id).await
+    manager.get_encoder_entry(layer, encoder_id).await
 }
 
 #[tauri::command]
@@ -499,47 +527,48 @@ pub async fn set_encoder_entry(
 }
 
 #[tauri::command]
-pub async fn get_all_encoders(state: State<'_, AppState>) -> Result<Vec<EncoderEntry>, String> {
-    let manager = state.read().await;
-    
-    // Get device info first to know encoder count
-    let device_info = manager.get_device_info().await?;
-    
-    let mut encoders = Vec::new();
-    
-    for encoder_id in 0..device_info.encoder_count {
-        match manager.get_encoder_entry(encoder_id).await {
-            Ok(entry) => encoders.push(entry),
-            Err(_) => {
-                // If we can't read an encoder, create a placeholder
-                encoders.push(EncoderEntry {
-                    encoder_id,
-                    ccw_keycode: 0,
-                    cw_keycode: 0,
-                    reserved: 0,
-                });
-            }
-        }
-    }
-    
-    Ok(encoders)
+pub async fn get_all_encoders(state: State<'_, AppState>) -> Result<Vec<Vec<EncoderEntry>>, String> {
+    let device_info = {
+        let manager = state.read().await;
+        manager.get_device_info().await?
+    };
+
+    let snapshot = build_full_state(&state, device_info, None).await?;
+    Ok(snapshot.encoders)
 }
 
 #[tauri::command]
 pub async fn set_all_encoders(
-    encoders: Vec<EncoderEntry>,
+    encoders: Vec<Vec<EncoderEntry>>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let manager = state.read().await;
     
-    for entry in encoders {
-        manager.set_encoder_entry(&entry).await?;
+    for layer_entries in encoders {
+        for entry in layer_entries {
+            manager.set_encoder_entry(&entry).await?;
+        }
     }
     
     Ok(())
 }
 
 // Configuration management commands
+
+#[tauri::command]
+pub async fn get_layer_state(state: State<'_, AppState>) -> Result<LayerState, String> {
+    let manager = state.read().await;
+    manager.get_layer_state().await
+}
+
+#[tauri::command]
+pub async fn set_layer_state(
+    layer_state: LayerState,
+    state: State<'_, AppState>,
+) -> Result<LayerState, String> {
+    let manager = state.read().await;
+    manager.set_layer_state(&layer_state).await
+}
 
 #[tauri::command]
 pub async fn save_config(state: State<'_, AppState>) -> Result<(), String> {
@@ -564,12 +593,13 @@ pub async fn reset_config(state: State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 pub async fn get_slave_keymap_entry(
     slave_addr: u8,
+    layer: u8,
     row: u8,
     col: u8,
     state: State<'_, AppState>,
 ) -> Result<SlaveKeymapEntry, String> {
     let manager = state.read().await;
-    manager.get_slave_keymap_entry(slave_addr, row, col).await
+    manager.get_slave_keymap_entry(slave_addr, layer, row, col).await
 }
 
 #[tauri::command]
@@ -586,11 +616,12 @@ pub async fn set_slave_keymap_entry(
 #[tauri::command]
 pub async fn get_slave_encoder_entry(
     slave_addr: u8,
+    layer: u8,
     encoder_id: u8,
     state: State<'_, AppState>,
 ) -> Result<SlaveEncoderEntry, String> {
     let manager = state.read().await;
-    manager.get_slave_encoder_entry(slave_addr, encoder_id).await
+    manager.get_slave_encoder_entry(slave_addr, layer, encoder_id).await
 }
 
 #[tauri::command]
@@ -623,33 +654,36 @@ pub async fn get_i2c_devices(
 pub async fn get_full_slave_keymap(
     slave_addr: u8,
     state: State<'_, AppState>,
-) -> Result<Vec<Vec<SlaveKeymapEntry>>, String> {
+) -> Result<Vec<Vec<Vec<SlaveKeymapEntry>>>, String> {
     let manager = state.read().await;
     
     // Get slave device info first to know matrix dimensions
     let device_info = manager.get_slave_info(slave_addr).await?;
+    let layer_count = device_info.layer_count.max(1);
     
-    let mut keymap = Vec::new();
-    
-    for row in 0..device_info.matrix_rows {
-        let mut row_entries = Vec::new();
-        
-        for col in 0..device_info.matrix_cols {
-            match manager.get_slave_keymap_entry(slave_addr, row, col).await {
-                Ok(entry) => row_entries.push(entry),
-                Err(_e) => {
-                    // If we can't read a key, create a placeholder
-                    row_entries.push(SlaveKeymapEntry {
-                        slave_addr,
-                        row,
-                        col,
-                        keycode: 0, // KC_NO
-                    });
+    let mut keymap = Vec::with_capacity(layer_count as usize);
+
+    for layer in 0..layer_count {
+        let mut layer_rows = Vec::with_capacity(device_info.matrix_rows as usize);
+        for row in 0..device_info.matrix_rows {
+            let mut row_entries = Vec::with_capacity(device_info.matrix_cols as usize);
+            for col in 0..device_info.matrix_cols {
+                match manager.get_slave_keymap_entry(slave_addr, layer, row, col).await {
+                    Ok(entry) => row_entries.push(entry),
+                    Err(_e) => {
+                        row_entries.push(SlaveKeymapEntry {
+                            slave_addr,
+                            layer,
+                            row,
+                            col,
+                            keycode: 0,
+                        });
+                    }
                 }
             }
+            layer_rows.push(row_entries);
         }
-        
-        keymap.push(row_entries);
+        keymap.push(layer_rows);
     }
     
     Ok(keymap)
@@ -659,23 +693,29 @@ pub async fn get_full_slave_keymap(
 pub async fn get_full_slave_encoders(
     slave_addr: u8,
     state: State<'_, AppState>,
-) -> Result<Vec<SlaveEncoderEntry>, String> {
+) -> Result<Vec<Vec<SlaveEncoderEntry>>, String> {
     let manager = state.read().await;
 
     let device_info = manager.get_slave_info(slave_addr).await?;
-    let mut encoders = Vec::new();
+    let layer_count = device_info.layer_count.max(1);
+    let mut encoders = Vec::with_capacity(layer_count as usize);
 
-    for encoder_id in 0..device_info.encoder_count {
-        match manager.get_slave_encoder_entry(slave_addr, encoder_id).await {
-            Ok(entry) => encoders.push(entry),
-            Err(_) => encoders.push(SlaveEncoderEntry {
-                slave_addr,
-                encoder_id,
-                ccw_keycode: 0,
-                cw_keycode: 0,
-                reserved: 0,
-            }),
+    for layer in 0..layer_count {
+        let mut layer_encoders = Vec::with_capacity(device_info.encoder_count as usize);
+        for encoder_id in 0..device_info.encoder_count {
+            match manager.get_slave_encoder_entry(slave_addr, layer, encoder_id).await {
+                Ok(entry) => layer_encoders.push(entry),
+                Err(_) => layer_encoders.push(SlaveEncoderEntry {
+                    slave_addr,
+                    layer,
+                    encoder_id,
+                    ccw_keycode: 0,
+                    cw_keycode: 0,
+                    reserved: 0,
+                }),
+            }
         }
+        encoders.push(layer_encoders);
     }
 
     Ok(encoders)
@@ -683,14 +723,16 @@ pub async fn get_full_slave_encoders(
 
 #[tauri::command]
 pub async fn set_full_slave_keymap(
-    keymap: Vec<Vec<SlaveKeymapEntry>>,
+    keymap: Vec<Vec<Vec<SlaveKeymapEntry>>>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let manager = state.read().await;
     
-    for row_entries in keymap {
-        for entry in row_entries {
-            manager.set_slave_keymap_entry(&entry).await?;
+    for layer_rows in keymap {
+        for row_entries in layer_rows {
+            for entry in row_entries {
+                manager.set_slave_keymap_entry(&entry).await?;
+            }
         }
     }
     
@@ -717,13 +759,15 @@ pub fn get_keycodes() -> Result<Vec<crate::keycodes::Keycode>, String> {
 
 #[tauri::command]
 pub async fn set_full_slave_encoders(
-    encoders: Vec<SlaveEncoderEntry>,
+    encoders: Vec<Vec<SlaveEncoderEntry>>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let manager = state.read().await;
 
-    for entry in encoders {
-        manager.set_slave_encoder_entry(&entry).await?;
+    for layer_entries in encoders {
+        for entry in layer_entries {
+            manager.set_slave_encoder_entry(&entry).await?;
+        }
     }
 
     Ok(())

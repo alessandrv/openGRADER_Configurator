@@ -5,7 +5,6 @@ mod keycodes;
 
 use commands::*;
 use hid_manager::HidManager;
-use keycodes::get_keycodes;
 use std::sync::Arc;
 use tauri::Manager;
 use tokio::sync::RwLock;
@@ -48,6 +47,8 @@ pub fn run() {
             load_full_state,
             get_enhanced_connection_status,
             get_board_layout,
+            get_layer_state,
+            set_layer_state,
             
             // Keymap management
             get_keymap_entry,

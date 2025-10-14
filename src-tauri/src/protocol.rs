@@ -23,6 +23,10 @@ pub enum ConfigCommand {
     SetI2CConfig = 0x0A,
     GetDeviceStatus = 0x0B,
     Reboot = 0x0C,
+    MidiSendRaw = 0x0D,
+    MidiNoteOn = 0x0E,
+    MidiNoteOff = 0x0F,
+    MidiControlChange = 0x10,
     // Slave device commands
     GetSlaveKeymap = 0x11,
     SetSlaveKeymap = 0x12,
@@ -30,6 +34,8 @@ pub enum ConfigCommand {
     GetSlaveEncoder = 0x14,
     SetSlaveEncoder = 0x15,
     GetLayoutInfo = 0x16,
+    SetLayerState = 0x17,
+    GetLayerState = 0x18,
 }
                          
 impl From<u8> for ConfigCommand {
@@ -47,12 +53,18 @@ impl From<u8> for ConfigCommand {
             0x0A => ConfigCommand::SetI2CConfig,
             0x0B => ConfigCommand::GetDeviceStatus,
             0x0C => ConfigCommand::Reboot,
+            0x0D => ConfigCommand::MidiSendRaw,
+            0x0E => ConfigCommand::MidiNoteOn,
+            0x0F => ConfigCommand::MidiNoteOff,
+            0x10 => ConfigCommand::MidiControlChange,
             0x11 => ConfigCommand::GetSlaveKeymap,
             0x12 => ConfigCommand::SetSlaveKeymap,
             0x13 => ConfigCommand::GetSlaveInfo,
             0x14 => ConfigCommand::GetSlaveEncoder,
             0x15 => ConfigCommand::SetSlaveEncoder,
             0x16 => ConfigCommand::GetLayoutInfo,
+            0x17 => ConfigCommand::SetLayerState,
+            0x18 => ConfigCommand::GetLayerState,
             _ => ConfigCommand::GetInfo, // Default fallback
         }
     }
@@ -162,19 +174,20 @@ pub struct DeviceInfo {
     pub matrix_rows: u8,
     pub matrix_cols: u8,
     pub encoder_count: u8,
+    pub layer_count: u8,
     pub i2c_devices: u8,
     pub device_name: String,
 }
 
 impl DeviceInfo {
     pub fn from_payload(payload: &[u8]) -> Result<Self, String> {
-        if payload.len() < 25 {
+        if payload.len() < 56 {
             return Err("Device info payload too short".to_string());
         }
 
         // Extract device name (null-terminated string)
-        let name_bytes = &payload[9..25];
-        let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(16);
+        let name_bytes = &payload[10..42];
+        let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(32);
         let device_name = String::from_utf8_lossy(&name_bytes[..name_end]).to_string();
 
         Ok(DeviceInfo {
@@ -186,7 +199,8 @@ impl DeviceInfo {
             matrix_rows: payload[5],
             matrix_cols: payload[6],
             encoder_count: payload[7],
-            i2c_devices: payload[8],
+            layer_count: payload[8],
+            i2c_devices: payload[9],
             device_name,
         })
     }
@@ -195,6 +209,7 @@ impl DeviceInfo {
 /// Keymap entry structure (matches firmware)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeymapEntry {
+    pub layer: u8,
     pub row: u8,
     pub col: u8,
     pub keycode: u16,
@@ -204,6 +219,7 @@ pub struct KeymapEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlaveKeymapEntry {
     pub slave_addr: u8,
+    pub layer: u8,
     pub row: u8,
     pub col: u8,
     pub keycode: u16,
@@ -213,6 +229,7 @@ pub struct SlaveKeymapEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlaveEncoderEntry {
     pub slave_addr: u8,
+    pub layer: u8,
     pub encoder_id: u8,
     pub ccw_keycode: u16,
     pub cw_keycode: u16,
@@ -221,35 +238,38 @@ pub struct SlaveEncoderEntry {
 
 impl KeymapEntry {
     pub fn from_payload(payload: &[u8]) -> Result<Self, String> {
-        if payload.len() < 4 {
+        if payload.len() < 5 {
             return Err("Keymap entry payload too short".to_string());
         }
 
         Ok(KeymapEntry {
-            row: payload[0],
-            col: payload[1],
-            keycode: u16::from_le_bytes([payload[2], payload[3]]),
+            layer: payload[0],
+            row: payload[1],
+            col: payload[2],
+            keycode: u16::from_le_bytes([payload[3], payload[4]]),
         })
     }
 }
 
 impl SlaveKeymapEntry {
     pub fn from_payload(slave_addr: u8, payload: &[u8]) -> Result<Self, String> {
-        if payload.len() < 4 {
+        if payload.len() < 5 {
             return Err("Slave keymap entry payload too short".to_string());
         }
 
         Ok(SlaveKeymapEntry {
             slave_addr,
-            row: payload[0],
-            col: payload[1],
-            keycode: u16::from_le_bytes([payload[2], payload[3]]),
+            layer: payload[0],
+            row: payload[1],
+            col: payload[2],
+            keycode: u16::from_le_bytes([payload[3], payload[4]]),
         })
     }
     
     pub fn to_payload(&self) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.push(self.slave_addr);
+        payload.push(self.layer);
         payload.push(self.row);
         payload.push(self.col);
         payload.extend_from_slice(&self.keycode.to_le_bytes());
@@ -260,6 +280,7 @@ impl SlaveKeymapEntry {
 impl KeymapEntry {
     pub fn to_payload(&self) -> Vec<u8> {
         let mut payload = Vec::new();
+        payload.push(self.layer);
         payload.push(self.row);
         payload.push(self.col);
         payload.extend_from_slice(&self.keycode.to_le_bytes());
@@ -270,6 +291,7 @@ impl KeymapEntry {
 /// Encoder entry structure (matches firmware)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncoderEntry {
+    pub layer: u8,
     pub encoder_id: u8,
     pub ccw_keycode: u16,
     pub cw_keycode: u16,
@@ -278,20 +300,22 @@ pub struct EncoderEntry {
 
 impl EncoderEntry {
     pub fn from_payload(payload: &[u8]) -> Result<Self, String> {
-        if payload.len() < 6 {
+        if payload.len() < 7 {
             return Err("Encoder entry payload too short".to_string());
         }
 
         Ok(EncoderEntry {
-            encoder_id: payload[0],
-            ccw_keycode: u16::from_le_bytes([payload[1], payload[2]]),
-            cw_keycode: u16::from_le_bytes([payload[3], payload[4]]),
-            reserved: payload[5],
+            layer: payload[0],
+            encoder_id: payload[1],
+            ccw_keycode: u16::from_le_bytes([payload[2], payload[3]]),
+            cw_keycode: u16::from_le_bytes([payload[4], payload[5]]),
+            reserved: payload[6],
         })
     }
 
     pub fn to_payload(&self) -> Vec<u8> {
         let mut payload = Vec::new();
+        payload.push(self.layer);
         payload.push(self.encoder_id);
         payload.extend_from_slice(&self.ccw_keycode.to_le_bytes());
         payload.extend_from_slice(&self.cw_keycode.to_le_bytes());
@@ -304,6 +328,7 @@ impl EncoderEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct I2CDeviceInfo {
     pub address: u8,
+    pub device_type: u8,
     pub status: u8,
     pub firmware_version_major: u8,
     pub firmware_version_minor: u8,
@@ -328,6 +353,7 @@ impl I2CDeviceInfo {
 
         Ok(I2CDeviceInfo {
             address: payload[offset],
+            device_type: payload[offset + 1],
             status: payload[offset + 2], // status is at offset 2 (after address and device_type)
             firmware_version_major: payload[offset + 3],
             firmware_version_minor: payload[offset + 4],
@@ -345,24 +371,25 @@ impl I2CDeviceInfo {
     }
     
     pub fn from_payload(payload: &[u8]) -> Result<Self, String> {
-        if payload.len() < 27 {
+        if payload.len() < 28 {
             return Err("I2C device info payload too short".to_string());
         }
 
         // Extract device name (null-terminated string)
-        let name_bytes = &payload[5..21];
+        let name_bytes = &payload[6..22];
         let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(16);
         let name = String::from_utf8_lossy(&name_bytes[..name_end]).to_string();
 
         let mut reserved = [0u8; 6];
-        reserved.copy_from_slice(&payload[21..27]);
+        reserved.copy_from_slice(&payload[22..28]);
 
         Ok(I2CDeviceInfo {
             address: payload[0],
-            status: payload[1],
-            firmware_version_major: payload[2],
-            firmware_version_minor: payload[3],
-            firmware_version_patch: payload[4],
+            device_type: payload[1],
+            status: payload[2],
+            firmware_version_major: payload[3],
+            firmware_version_minor: payload[4],
+            firmware_version_patch: payload[5],
             name,
             reserved,
         })
@@ -371,27 +398,53 @@ impl I2CDeviceInfo {
 
 impl SlaveEncoderEntry {
     pub fn from_payload(slave_addr: u8, payload: &[u8]) -> Result<Self, String> {
-        if payload.len() < 6 {
+        if payload.len() < 7 {
             return Err("Slave encoder entry payload too short".to_string());
         }
 
         Ok(SlaveEncoderEntry {
             slave_addr,
-            encoder_id: payload[0],
-            ccw_keycode: u16::from_le_bytes([payload[1], payload[2]]),
-            cw_keycode: u16::from_le_bytes([payload[3], payload[4]]),
-            reserved: payload[5],
+            layer: payload[0],
+            encoder_id: payload[1],
+            ccw_keycode: u16::from_le_bytes([payload[2], payload[3]]),
+            cw_keycode: u16::from_le_bytes([payload[4], payload[5]]),
+            reserved: payload[6],
         })
     }
 
     pub fn to_payload(&self) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.push(self.slave_addr);
+        payload.push(self.layer);
         payload.push(self.encoder_id);
         payload.extend_from_slice(&self.ccw_keycode.to_le_bytes());
         payload.extend_from_slice(&self.cw_keycode.to_le_bytes());
         payload.push(self.reserved);
         payload
+    }
+}
+
+/// Layer state payload (active layer mask + default layer index)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayerState {
+    pub active_mask: u8,
+    pub default_layer: u8,
+}
+
+impl LayerState {
+    pub fn from_payload(payload: &[u8]) -> Result<Self, String> {
+        if payload.len() < 2 {
+            return Err("Layer state payload too short".to_string());
+        }
+
+        Ok(LayerState {
+            active_mask: payload[0],
+            default_layer: payload[1],
+        })
+    }
+
+    pub fn to_payload(&self) -> [u8; 2] {
+        [self.active_mask, self.default_layer]
     }
 }
 

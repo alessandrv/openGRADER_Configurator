@@ -1,4 +1,5 @@
 <script>
+    // @ts-nocheck
     import { onMount, onDestroy } from 'svelte';
     import { invoke } from '@tauri-apps/api/core';
 
@@ -19,10 +20,19 @@
     let selectedDevice = $state('main'); // 'main' or slave address
     
     // Keymap and encoder data
-    let keymap = $state([]);
-    let slaveKeymaps = $state({}); // Map of slave address -> keymap
-    let slaveEncoders = $state({}); // Map of slave address -> encoders
-    let encoders = $state([]);
+    let keymap = $state([]); // [layer][row][col]
+    let slaveKeymaps = $state({}); // Map of slave address -> [layer][row][col]
+    let slaveEncoders = $state({}); // Map of slave address -> [layer][encoder]
+    let encoders = $state([]); // [layer][encoder]
+    let selectedLayer = $state(0);
+    let layerCount = $state(1);
+    let layerState = $state(null);
+    let layerStateBusy = $state(false);
+    let momentaryLayer = $state(null);
+    let lastStableLayer = $state(0);
+    let baselineLayerMask = 0;
+    let hardwareActiveLayer = $state(0);
+    let manualLayerOverride = false;
     let boardLayout = $state(null);
     let activeEncoderMenu = $state(null);
     let keycodes = {};
@@ -35,6 +45,7 @@
     let originalEncoders = [];
     let originalSlaveKeymaps = {};
     let originalSlaveEncoders = {};
+    let originalLayerState = null;
     let hasChanges = $state(false);
     let showSavePopup = $state(false);
     let connectionStatus = $state('disconnected');
@@ -51,6 +62,7 @@
     // Autoconnect state
     let autoConnectInterval = null;
     let connectionCheckInterval = null;
+    let layerStatePollInterval = null;
 
     onMount(() => {
         console.log('=== FRONTEND: App started ===');
@@ -69,6 +81,7 @@
             document.removeEventListener('keydown', handleGlobalKeydown);
             stopAutoConnect();
             stopConnectionCheck();
+            stopLayerStatePolling();
         };
     });
     
@@ -110,6 +123,23 @@
             connectionCheckInterval = null;
         }
     }
+
+    function startLayerStatePolling() {
+        if (layerStatePollInterval) return;
+
+        layerStatePollInterval = setInterval(() => {
+            if (isConnected) {
+                refreshLayerStateFromDevice();
+            }
+        }, 500);
+    }
+
+    function stopLayerStatePolling() {
+        if (layerStatePollInterval) {
+            clearInterval(layerStatePollInterval);
+            layerStatePollInterval = null;
+        }
+    }
     
     async function tryAutoConnect() {
         try {
@@ -119,8 +149,20 @@
             isConnected = true;
             connectionStatus = 'connected';
             deviceInfo = result.device_info;
-            keymap = result.keymap || [];
-            encoders = result.encoders || [];
+            keymap = Array.isArray(result.keymap) ? result.keymap : [];
+            encoders = Array.isArray(result.encoders) ? result.encoders : [];
+            layerCount = Math.max(deviceInfo?.layer_count ?? keymap.length ?? 1, 1);
+            const maskLayers = Math.min(layerCount, 8);
+            const defaultMask = maskLayers >= 8 ? 0xff : ((1 << maskLayers) - 1) & 0xff;
+            const initialLayerState = result.layer_state ?? {
+                active_mask: defaultMask === 0 ? 1 : defaultMask,
+                default_layer: 0,
+            };
+            updateLayerCountForDevice('main');
+            updateLayerStateLocal(initialLayerState, { fromDevice: true });
+            manualLayerOverride = false;
+
+            await refreshLayerStateFromDevice();
             boardLayout = result.layout ?? null;
             dataLoaded = true;
 
@@ -157,6 +199,7 @@
             
             // Start monitoring connection
             startConnectionCheck();
+            startLayerStatePolling();
             
             // Clear any previous errors
             error = null;
@@ -170,6 +213,7 @@
         try {
             // Try a lightweight operation to check if device is still connected
             await invoke('get_board_layout');
+            await refreshLayerStateFromDevice();
         } catch (e) {
             console.log('Device disconnected, cleaning up...');
             handleDisconnection();
@@ -184,6 +228,10 @@
         encoders = [];
         slaveKeymaps = {};
         slaveEncoders = {};
+    selectedLayer = 0;
+    layerCount = 1;
+    layerStateBusy = false;
+    updateLayerStateLocal(null);
         boardLayout = null;
         selectedKey = null;
         selectedEncoder = null;
@@ -192,12 +240,14 @@
         originalEncoders = [];
         originalSlaveKeymaps = {};
         originalSlaveEncoders = {};
+    originalLayerState = null;
         dataLoaded = false;
         hasChanges = false;
         showSavePopup = false;
         i2cDevices = [];
         
         stopConnectionCheck();
+        stopLayerStatePolling();
         
         console.log('Device disconnected, will attempt to reconnect...');
     }
@@ -205,15 +255,335 @@
     // Load keycodes from backend
     async function loadKeycodes() {
         try {
-            keycodes = await invoke('get_keycodes');
+            const keycodeList = await invoke('get_keycodes');
+            const sorted = Array.isArray(keycodeList)
+                ? [...keycodeList].sort((a, b) => Number(a.code) - Number(b.code))
+                : [];
+
+            const mapped = {};
+            for (const entry of sorted) {
+                if (entry && typeof entry.code === 'number') {
+                    mapped[entry.code] = entry;
+                }
+            }
+
+            keycodes = mapped;
         } catch (e) {
             console.error('Failed to load keycodes:', e);
+        }
+    }
+
+    function updateLayerCountForDevice(deviceId) {
+        if (deviceId === 'main') {
+            layerCount = Math.max(deviceInfo?.layer_count ?? keymap.length ?? 1, 1);
+        } else {
+            const addr = parseInt(deviceId, 10);
+            const layers = slaveKeymaps[addr];
+            layerCount = Math.max(layers ? layers.length : 1, 1);
+        }
+        const clampedSelected = clampLayerIndex(selectedLayer);
+        if (clampedSelected !== selectedLayer) {
+            selectedLayer = clampedSelected;
+        }
+
+        const clampedActive = clampLayerIndex(hardwareActiveLayer);
+        if (clampedActive !== hardwareActiveLayer) {
+            hardwareActiveLayer = clampedActive;
+        }
+
+        if (selectedLayer === hardwareActiveLayer) {
+            manualLayerOverride = false;
         }
     }
 
     function setSelectedDevice(deviceId) {
         if (selectedDevice !== deviceId) {
             selectedDevice = deviceId;
+            selectedLayer = 0;
+            hardwareActiveLayer = 0;
+            manualLayerOverride = false;
+            baselineLayerMask = bitForLayer(0) || 1;
+            updateLayerCountForDevice(deviceId);
+        }
+    }
+
+    function layerIndices() {
+        return Array.from({ length: layerCount }, (_, i) => i);
+    }
+
+    function clampLayerIndex(index) {
+        if (!Number.isFinite(index)) {
+            return 0;
+        }
+        if (layerCount <= 0) {
+            return 0;
+        }
+        return Math.max(0, Math.min(Math.floor(index), layerCount - 1));
+    }
+
+    function bitForLayer(index) {
+        if (!Number.isFinite(index)) {
+            return 0;
+        }
+        if (index < 0 || index >= 8) {
+            return 0;
+        }
+        return 1 << index;
+    }
+
+    function validLayerMask(mask) {
+        if (!Number.isFinite(mask)) {
+            return 0;
+        }
+        const availableLayers = Math.min(layerCount, 8);
+        if (availableLayers <= 0) {
+            return 0;
+        }
+        const allowedMask = availableLayers >= 8 ? 0xff : ((1 << availableLayers) - 1) & 0xff;
+        return (mask & allowedMask) & 0xff;
+    }
+
+    function extractActiveLayers(mask) {
+        const active = [];
+        const filtered = validLayerMask(mask);
+        for (let i = 0; i < layerCount && i < 8; i++) {
+            if ((filtered & bitForLayer(i)) !== 0) {
+                active.push(i);
+            }
+        }
+        return active;
+    }
+
+    function stableLayerStateSnapshot(state) {
+        if (!state) {
+            return null;
+        }
+
+        const normalizedDefault = clampLayerIndex(state.default_layer ?? 0);
+        const normalizedMask = validLayerMask(state.active_mask ?? 0);
+        const activeLayers = extractActiveLayers(normalizedMask);
+        const stableLayer = activeLayers.length > 0 ? clampLayerIndex(activeLayers[0]) : normalizedDefault;
+        const stableMask = bitForLayer(stableLayer) || 1;
+
+        return {
+            active_mask: stableMask,
+            default_layer: normalizedDefault,
+        };
+    }
+
+    function updateLayerStateLocal(state, { fromDevice = false } = {}) {
+        if (!state) {
+            layerState = null;
+            momentaryLayer = null;
+            lastStableLayer = 0;
+            baselineLayerMask = 0;
+            hardwareActiveLayer = 0;
+            manualLayerOverride = false;
+            if (selectedLayer !== 0) {
+                selectedLayer = 0;
+            }
+            return;
+        }
+
+        const previousMask = layerState?.active_mask ?? null;
+        const previousDefault = layerState?.default_layer ?? null;
+        const previousHardware = hardwareActiveLayer;
+
+        const normalizedDefault = clampLayerIndex(state.default_layer ?? 0);
+        let mask = validLayerMask(state.active_mask ?? 0);
+
+        if (mask === 0) {
+            mask = bitForLayer(normalizedDefault) || 1;
+        }
+
+        const activeLayers = extractActiveLayers(mask);
+        const highestLayer = clampLayerIndex(activeLayers.length > 0 ? activeLayers[activeLayers.length - 1] : normalizedDefault);
+
+        let newBaselineMask = baselineLayerMask;
+        let newMomentaryLayer = null;
+
+        if (activeLayers.length <= 1) {
+            newBaselineMask = mask;
+            lastStableLayer = highestLayer;
+            newMomentaryLayer = null;
+        } else {
+            const highestBit = bitForLayer(highestLayer);
+            if ((newBaselineMask & highestBit) === 0) {
+                newMomentaryLayer = highestLayer;
+            } else {
+                newMomentaryLayer = null;
+            }
+        }
+
+        baselineLayerMask = newBaselineMask;
+        momentaryLayer = newMomentaryLayer;
+        if (momentaryLayer === null) {
+            lastStableLayer = highestLayer;
+        }
+
+        hardwareActiveLayer = highestLayer;
+
+        const clampedSelection = clampLayerIndex(selectedLayer);
+        if (clampedSelection !== selectedLayer) {
+            selectedLayer = clampedSelection;
+        }
+
+        const maskChanged = previousMask !== mask || previousDefault !== normalizedDefault || previousHardware !== highestLayer;
+
+        if (fromDevice) {
+            if (maskChanged) {
+                manualLayerOverride = false;
+            }
+            if (!manualLayerOverride || maskChanged) {
+                if (selectedLayer !== highestLayer) {
+                    selectedLayer = highestLayer;
+                }
+            }
+        } else if (!manualLayerOverride) {
+            if (selectedLayer !== highestLayer) {
+                selectedLayer = highestLayer;
+            }
+        }
+
+        if (selectedLayer === hardwareActiveLayer) {
+            manualLayerOverride = false;
+        }
+
+        layerState = {
+            active_mask: mask,
+            default_layer: normalizedDefault,
+        };
+    }
+
+    function isLayerActive(index) {
+        if (!layerState) {
+            return index === 0;
+        }
+        const bit = bitForLayer(index);
+        if (bit === 0) {
+            return index === 0;
+        }
+        return (layerState.active_mask & bit) !== 0;
+    }
+
+    function isSoleActiveLayer(index) {
+        if (!layerState) {
+            return index === 0;
+        }
+        const targetMask = bitForLayer(index) || 1;
+        const filtered = validLayerMask(layerState.active_mask ?? 0);
+        return filtered === targetMask;
+    }
+
+    function isDefaultLayer(index) {
+        return layerState?.default_layer === index;
+    }
+
+    function selectLayer(index) {
+        const clamped = clampLayerIndex(index);
+        if (selectedLayer !== clamped) {
+            selectedLayer = clamped;
+        }
+        manualLayerOverride = clamped !== hardwareActiveLayer;
+    }
+
+    async function applyLayerStateUpdate(newState, options = {}) {
+        const { fromDevice = false } = options;
+
+        if (selectedDevice !== 'main') {
+            updateLayerStateLocal(newState, { fromDevice });
+            checkForChanges();
+            return;
+        }
+
+        if (layerStateBusy) {
+            return;
+        }
+
+        layerStateBusy = true;
+        try {
+            const updated = await invoke('set_layer_state', { layerState: newState });
+            updateLayerStateLocal(updated ?? newState, { fromDevice: true });
+        } catch (e) {
+            error = `Failed to update layer state: ${e}`;
+            console.error('Failed to update layer state:', e);
+        } finally {
+            layerStateBusy = false;
+            checkForChanges();
+        }
+    }
+
+    async function refreshLayerStateFromDevice() {
+        if (!isConnected || selectedDevice !== 'main') {
+            return;
+        }
+
+        try {
+            const refreshedLayerState = await invoke('get_layer_state');
+            if (refreshedLayerState) {
+                updateLayerStateLocal(refreshedLayerState, { fromDevice: true });
+                checkForChanges();
+            }
+        } catch (e) {
+            console.warn('Failed to refresh layer state:', e);
+        }
+    }
+
+    async function setDefaultLayer(index) {
+        if (!layerState) {
+            return;
+        }
+        if (layerStateBusy && selectedDevice === 'main') {
+            return;
+        }
+        const target = clampLayerIndex(index);
+        const currentDefault = clampLayerIndex(layerState.default_layer ?? 0);
+        const targetMask = bitForLayer(target) || 1;
+
+        if (currentDefault === target && layerState.active_mask === targetMask) {
+            if (selectedLayer !== target) {
+                selectedLayer = target;
+            }
+            return;
+        }
+
+        const newState = {
+            active_mask: targetMask,
+            default_layer: target,
+        };
+        await applyLayerStateUpdate(newState);
+        manualLayerOverride = false;
+        if (selectedLayer !== target) {
+            selectedLayer = target;
+        }
+    }
+
+    async function setActiveLayer(index) {
+        if (!layerState) {
+            return;
+        }
+        if (layerStateBusy && selectedDevice === 'main') {
+            return;
+        }
+        const target = clampLayerIndex(index);
+        const targetMask = bitForLayer(target) || 1;
+        const currentMask = layerState.active_mask ?? 0;
+
+        if (currentMask === targetMask) {
+            if (selectedLayer !== target) {
+                selectedLayer = target;
+            }
+            return;
+        }
+
+        const newState = {
+            active_mask: targetMask,
+            default_layer: clampLayerIndex(layerState.default_layer ?? 0),
+        };
+        await applyLayerStateUpdate(newState);
+        manualLayerOverride = false;
+        if (selectedLayer !== target) {
+            selectedLayer = target;
         }
     }
 
@@ -222,6 +592,7 @@
         originalEncoders = JSON.parse(JSON.stringify(encoders));
         originalSlaveKeymaps = JSON.parse(JSON.stringify(slaveKeymaps));
         originalSlaveEncoders = JSON.parse(JSON.stringify(slaveEncoders));
+        originalLayerState = stableLayerStateSnapshot(layerState);
         hasChanges = false;
         showSavePopup = false;
     }
@@ -230,8 +601,10 @@
         const keymapChanged = JSON.stringify(keymap) !== JSON.stringify(originalKeymap);
         const encodersChanged = JSON.stringify(encoders) !== JSON.stringify(originalEncoders);
         const slaveKeymapsChanged = JSON.stringify(slaveKeymaps) !== JSON.stringify(originalSlaveKeymaps);
-        const slaveEncodersChanged = JSON.stringify(slaveEncoders) !== JSON.stringify(originalSlaveEncoders);
-        hasChanges = keymapChanged || encodersChanged || slaveKeymapsChanged || slaveEncodersChanged;
+    const slaveEncodersChanged = JSON.stringify(slaveEncoders) !== JSON.stringify(originalSlaveEncoders);
+    const currentLayerSnapshot = stableLayerStateSnapshot(layerState);
+    const layerStateChanged = JSON.stringify(currentLayerSnapshot) !== JSON.stringify(originalLayerState);
+        hasChanges = keymapChanged || encodersChanged || slaveKeymapsChanged || slaveEncodersChanged || layerStateChanged;
         showSavePopup = hasChanges;
     }
 
@@ -259,32 +632,50 @@
     }
 
     // Keymap functions
-    async function updateKeymap(row, col, keycode) {
+    async function updateKeymap(row, col, keycode, layerOverride = selectedLayer) {
+        const layer = layerOverride;
         try {
             if (selectedDevice === 'main') {
                 await invoke('set_keymap_entry', {
-                    entry: { row, col, keycode }
+                    entry: { layer, row, col, keycode }
                 });
-                
-                keymap[row][col].keycode = keycode;
-                keymap = keymap;
+                const layers = [...keymap];
+                const layerEntries = [...(layers[layer] ?? [])];
+                const rowEntries = [...(layerEntries[row] ?? [])];
+                if (rowEntries[col]) {
+                    rowEntries[col] = {
+                        ...rowEntries[col],
+                        layer,
+                        row,
+                        col,
+                        keycode,
+                    };
+                    layerEntries[row] = rowEntries;
+                    layers[layer] = layerEntries;
+                    keymap = layers;
+                }
             } else {
                 // Update slave device keymap
-                    const slaveAddr = parseInt(selectedDevice, 10);
+                const slaveAddr = parseInt(selectedDevice, 10);
                 await invoke('set_slave_keymap_entry', {
-                    entry: { slave_addr: slaveAddr, row, col, keycode }
+                    entry: { slave_addr: slaveAddr, layer, row, col, keycode }
                 });
-                
-                if (!slaveKeymaps[slaveAddr]) {
-                    slaveKeymaps[slaveAddr] = [];
-                }
-                
-                if (!slaveKeymaps[slaveAddr][row]) {
-                    slaveKeymaps[slaveAddr][row] = [];
-                }
-                
-                slaveKeymaps[slaveAddr][row][col] = { row, col, keycode };
-                slaveKeymaps = {...slaveKeymaps}; // trigger reactivity
+                const existingLayers = [...(slaveKeymaps[slaveAddr] ?? [])];
+                const layerRows = [...(existingLayers[layer] ?? [])];
+                const rowEntries = [...(layerRows[row] ?? [])];
+                rowEntries[col] = {
+                    slave_addr: slaveAddr,
+                    layer,
+                    row,
+                    col,
+                    keycode,
+                };
+                layerRows[row] = rowEntries;
+                existingLayers[layer] = layerRows;
+                slaveKeymaps = {
+                    ...slaveKeymaps,
+                    [slaveAddr]: existingLayers,
+                }; // trigger reactivity
             }
             
             checkForChanges();
@@ -316,6 +707,9 @@
             if (!originalSlaveKeymaps[String(slaveAddr)]) {
                 originalSlaveKeymaps[String(slaveAddr)] = JSON.parse(JSON.stringify(slaveKeymap));
             }
+            if (selectedDevice === String(slaveAddr)) {
+                updateLayerCountForDevice(selectedDevice);
+            }
             checkForChanges();
             console.log(`[loadSlaveKeymap] Successfully loaded keymap for slave device ${slaveAddr}`);
         } catch (e) {
@@ -338,6 +732,9 @@
             slaveEncoders = { ...slaveEncoders };
             if (!originalSlaveEncoders[String(slaveAddr)]) {
                 originalSlaveEncoders[String(slaveAddr)] = JSON.parse(JSON.stringify(slaveEncoderList));
+            }
+            if (selectedDevice === String(slaveAddr)) {
+                updateLayerCountForDevice(selectedDevice);
             }
             checkForChanges();
         } catch (e) {
@@ -373,19 +770,21 @@
     // Get the current active keymap based on selected device
     function getCurrentKeymap() {
         if (selectedDevice === 'main') {
-            return keymap;
+            return keymap?.[selectedLayer] ?? [];
         } else {
             const slaveAddr = parseInt(selectedDevice, 10);
-            return slaveKeymaps[slaveAddr] || [];
+            const layers = slaveKeymaps[slaveAddr];
+            return layers?.[selectedLayer] ?? [];
         }
     }
 
     function getCurrentEncoders() {
         if (selectedDevice === 'main') {
-            return encoders;
+            return encoders?.[selectedLayer] ?? [];
         } else {
             const slaveAddr = parseInt(selectedDevice, 10);
-            return slaveEncoders[slaveAddr] || [];
+            const layers = slaveEncoders[slaveAddr];
+            return layers?.[selectedLayer] ?? [];
         }
     }
 
@@ -481,6 +880,7 @@
         }
 
         const encoderEntry = getEncoderEntryById(encoderId) || {
+            layer: selectedLayer,
             encoder_id: encoderId,
             ccw_keycode: 0,
             cw_keycode: 0,
@@ -499,11 +899,13 @@
         activeEncoderMenu = null;
     }
 
-    async function updateEncoder(encoderId, ccwKeycode, cwKeycode) {
+    async function updateEncoder(encoderId, ccwKeycode, cwKeycode, layerOverride = selectedLayer) {
+        const layer = layerOverride;
         try {
             if (selectedDevice === 'main') {
                 await invoke('set_encoder_entry', {
                     entry: {
+                        layer,
                         encoder_id: encoderId,
                         ccw_keycode: ccwKeycode,
                         cw_keycode: cwKeycode,
@@ -511,21 +913,43 @@
                     }
                 });
 
-                const encoder = encoders.find(e => e.encoder_id === encoderId);
-                if (encoder) {
-                    encoder.ccw_keycode = ccwKeycode;
-                    encoder.cw_keycode = cwKeycode;
-                    encoders = encoders;
+                const layers = [...encoders];
+                const layerEncoders = [...(layers[layer] ?? [])];
+                const encoderIndex = layerEncoders.findIndex(e => e.encoder_id === encoderId);
+                const reserved = encoderIndex >= 0 ? layerEncoders[encoderIndex].reserved ?? 0 : 0;
+                const updatedEntry = {
+                    layer,
+                    encoder_id: encoderId,
+                    ccw_keycode: ccwKeycode,
+                    cw_keycode: cwKeycode,
+                    reserved,
+                };
+                if (encoderIndex >= 0) {
+                    layerEncoders[encoderIndex] = {
+                        ...layerEncoders[encoderIndex],
+                        ...updatedEntry,
+                    };
+                } else {
+                    layerEncoders.push(updatedEntry);
                 }
+                layers[layer] = layerEncoders;
+                encoders = layers;
             } else {
                 const slaveAddr = parseInt(selectedDevice, 10);
-                const existingEncoders = slaveEncoders[slaveAddr] ? [...slaveEncoders[slaveAddr]] : [];
+                if (!slaveEncoders[slaveAddr]) {
+                    slaveEncoders[slaveAddr] = [];
+                }
+                if (!slaveEncoders[slaveAddr][layer]) {
+                    slaveEncoders[slaveAddr][layer] = [];
+                }
+                const existingEncoders = [...(slaveEncoders[slaveAddr][layer] ?? [])];
                 const entryIndex = existingEncoders.findIndex(e => e.encoder_id === encoderId);
                 const reserved = entryIndex >= 0 ? existingEncoders[entryIndex].reserved ?? 0 : 0;
 
                 await invoke('set_slave_encoder_entry', {
                     entry: {
                         slave_addr: slaveAddr,
+                        layer,
                         encoder_id: encoderId,
                         ccw_keycode: ccwKeycode,
                         cw_keycode: cwKeycode,
@@ -536,12 +960,15 @@
                 if (entryIndex >= 0) {
                     existingEncoders[entryIndex] = {
                         ...existingEncoders[entryIndex],
+                        layer,
                         ccw_keycode: ccwKeycode,
-                        cw_keycode: cwKeycode
+                        cw_keycode: cwKeycode,
+                        reserved,
                     };
                 } else {
                     existingEncoders.push({
                         slave_addr: slaveAddr,
+                        layer,
                         encoder_id: encoderId,
                         ccw_keycode: ccwKeycode,
                         cw_keycode: cwKeycode,
@@ -549,9 +976,11 @@
                     });
                 }
 
+                const slaveLayers = [...(slaveEncoders[slaveAddr] ?? [])];
+                slaveLayers[layer] = existingEncoders;
                 slaveEncoders = {
                     ...slaveEncoders,
-                    [slaveAddr]: existingEncoders
+                    [slaveAddr]: slaveLayers
                 };
             }
             checkForChanges();
@@ -619,6 +1048,12 @@
         loading = false;
     }
 
+    const OP_LAYER_ID_MASK = 0x1f;
+    const OP_TO_BASE = 0x5200;
+    const OP_TO_MAX = 0x521F;
+    const OP_MOMENTARY_BASE = 0x5220;
+    const OP_MOMENTARY_MAX = 0x523F;
+
     // MIDI encoding helpers
     const OP_MIDI_CC_BASE = 0x7E10;
     
@@ -641,8 +1076,34 @@
         return (OP_MIDI_CC_BASE + (ch << 11) + (n << 4) + 0x0F) & 0xFFFF;
     }
 
+    function layerKeycodeInfo(code) {
+        if (typeof code !== 'number') return null;
+        const layer = code & OP_LAYER_ID_MASK;
+        if (code >= OP_TO_BASE && code <= OP_TO_MAX) {
+            return {
+                layer,
+                label: `Change layer (${layer})`,
+                name: `KC_TO(${layer})`,
+                category: 'Layers'
+            };
+        }
+        if (code >= OP_MOMENTARY_BASE && code <= OP_MOMENTARY_MAX) {
+            return {
+                layer,
+                label: `Momentary layer (${layer})`,
+                name: `KC_MO(${layer})`,
+                category: 'Layers'
+            };
+        }
+        return null;
+    }
+
     function formatKeyLabel(code) {
         if (typeof code !== 'number') return [''];
+        const layerInfo = layerKeycodeInfo(code);
+        if (layerInfo) {
+            return [layerInfo.label];
+        }
         if (code >= OP_MIDI_CC_BASE) {
             const delta = (code - OP_MIDI_CC_BASE) & 0xFFFF;
             const ch = ((delta >> 11) & 0x0F) + 1;
@@ -664,13 +1125,52 @@
         return [`0x${code.toString(16).toUpperCase().padStart(4, '0')}`];
     }
 
+    function getLayerKeyOptions() {
+        const maxLayers = Math.max(layerCount ?? 1, 1);
+        const options = [];
+        const limit = Math.min(maxLayers, OP_LAYER_ID_MASK + 1);
+        for (let layer = 0; layer < limit; layer++) {
+            const toCode = OP_TO_BASE + layer;
+            const toInfo = layerKeycodeInfo(toCode);
+            if (toInfo) {
+                options.push({
+                    value: toCode,
+                    label: toInfo.label,
+                    name: toInfo.name,
+                    category: toInfo.category
+                });
+            }
+
+            const moCode = OP_MOMENTARY_BASE + layer;
+            const moInfo = layerKeycodeInfo(moCode);
+            if (moInfo) {
+                options.push({
+                    value: moCode,
+                    label: moInfo.label,
+                    name: moInfo.name,
+                    category: moInfo.category
+                });
+            }
+        }
+        return options;
+    }
+
     function getKeycodeOptions() {
-        return Object.entries(keycodes).map(([code, keycode]) => ({
+        const baseOptions = Object.entries(keycodes).map(([code, keycode]) => ({
             value: parseInt(code),
             label: `${keycode.display_name}`,
             name: keycode.name,
             category: keycode.category
         }));
+
+        const merged = new Map();
+        for (const option of [...baseOptions, ...getLayerKeyOptions()]) {
+            if (!merged.has(option.value)) {
+                merged.set(option.value, option);
+            }
+        }
+
+        return Array.from(merged.values());
     }
 
     function getKeycodesByCategory() {
@@ -687,7 +1187,7 @@
 
     // Modal handlers
     function openKeyModal(row, col, keycode) {
-        modalKey = { row, col, keycode };
+        modalKey = { row, col, keycode, layer: selectedLayer };
         keyModalTab = 'standard';
         showKeyModal = true;
         activeEncoderMenu = null;
@@ -700,13 +1200,16 @@
 
     function applyKeyChange() {
         if (modalKey) {
-            updateKeymap(modalKey.row, modalKey.col, modalKey.keycode);
+            updateKeymap(modalKey.row, modalKey.col, modalKey.keycode, modalKey.layer ?? selectedLayer);
             closeKeyModal();
         }
     }
 
     function openEncoderModal(encoder, direction) {
         modalEncoder = { ...encoder };
+        if (modalEncoder.layer === undefined) {
+            modalEncoder.layer = selectedLayer;
+        }
         encoderModalDirection = direction;
         encoderModalTab = 'standard';
         showEncoderModal = true;
@@ -723,7 +1226,8 @@
             updateEncoder(
                 modalEncoder.encoder_id,
                 modalEncoder.ccw_keycode,
-                modalEncoder.cw_keycode
+                modalEncoder.cw_keycode,
+                modalEncoder.layer ?? selectedLayer
             );
             closeEncoderModal();
         }
@@ -769,6 +1273,8 @@
         encoders = JSON.parse(JSON.stringify(originalEncoders));
         slaveKeymaps = JSON.parse(JSON.stringify(originalSlaveKeymaps));
         slaveEncoders = JSON.parse(JSON.stringify(originalSlaveEncoders));
+        const stateToRestore = originalLayerState ? { ...originalLayerState } : null;
+        updateLayerStateLocal(stateToRestore, { fromDevice: true });
         hasChanges = false;
         showSavePopup = false;
     }
@@ -927,6 +1433,65 @@
                         <h2>Keymap Configuration</h2>
                         <p>Click on any key to customize its function</p>
                     </div>
+
+                    <div class="layer-toolbar" aria-label="Layer controls">
+                        <div class="layer-buttons" role="tablist" aria-label="Layer selection">
+                            {#each layerIndices() as layerIndex}
+                                <button
+                                    type="button"
+                                    class="layer-button"
+                                    class:current={selectedLayer === layerIndex}
+                                    class:active-hardware={hardwareActiveLayer === layerIndex}
+                                    onclick={() => selectLayer(layerIndex)}
+                                >
+                                    <span class="layer-label">Layer {layerIndex}</span>
+                                    {#if isDefaultLayer(layerIndex)}
+                                        <span class="layer-pill">Default</span>
+                                    {/if}
+                                    {#if hardwareActiveLayer === layerIndex}
+                                        <span class="layer-pill active">Active</span>
+                                    {/if}
+                                    {#if momentaryLayer === layerIndex}
+                                        <span class="layer-pill momentary">Momentary</span>
+                                    {/if}
+                                    {#if !isLayerActive(layerIndex)}
+                                        <span class="layer-pill inactive">Inactive</span>
+                                    {/if}
+                                </button>
+                            {/each}
+                        </div>
+
+                        {#if selectedDevice === 'main'}
+                            <div class="layer-state-controls">
+                                <button
+                                    type="button"
+                                    class="secondary-button"
+                                    onclick={() => setActiveLayer(selectedLayer)}
+                                    disabled={layerStateBusy || isSoleActiveLayer(selectedLayer)}
+                                >
+                                    Set Active
+                                </button>
+                                <button
+                                    type="button"
+                                    class="secondary-button"
+                                    onclick={() => setDefaultLayer(selectedLayer)}
+                                    disabled={layerStateBusy || isDefaultLayer(selectedLayer)}
+                                >
+                                    Set as Default
+                                </button>
+                                <div class="layer-state-summary">
+                                    <span>Active {hardwareActiveLayer}</span>
+                                    <span>Default {layerState?.default_layer ?? 0}</span>
+                                    <span>Editing {selectedLayer}</span>
+                                </div>
+                                {#if momentaryLayer !== null}
+                                    <div class="momentary-indicator">
+                                        Momentary layer {momentaryLayer}
+                                    </div>
+                                {/if}
+                            </div>
+                        {/if}
+                    </div>
                     
                     {#if loadingKeymap}
                         <div class="loading-state">
@@ -934,7 +1499,7 @@
                             <h3>Loading Keymap...</h3>000
                             <p>{selectedDevice === 'main' ? 'Fetching key configuration from device' : `Loading keymap from slave device 0x${parseInt(selectedDevice, 10).toString(16).toUpperCase()}`}</p>
                         </div>
-                    {:else if (selectedDevice === 'main' && keymap.length > 0) || (selectedDevice !== 'main' && slaveKeymaps[selectedDevice] && slaveKeymaps[selectedDevice].length > 0)}
+                    {:else if getCurrentKeymap().length > 0}
                         <!-- keys open modal -->
                         <div class="keymap-container">
                             <div
@@ -1060,7 +1625,7 @@
                 aria-labelledby="key-modal-title"
             >
                 <div class="modal-header">
-                    <h3 id="key-modal-title">Edit Key R{modalKey.row}C{modalKey.col}</h3>
+                    <h3 id="key-modal-title">Edit Key L{modalKey.layer ?? selectedLayer} · R{modalKey.row}C{modalKey.col}</h3>
                     <button class="modal-close" onclick={closeKeyModal} aria-label="Close modal">
                         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
                             <line x1="18" y1="6" x2="6" y2="18" stroke="currentColor" stroke-width="2"/>
@@ -1175,7 +1740,7 @@
                 aria-labelledby="encoder-modal-title"
             >
                 <div class="modal-header">
-                    <h3 id="encoder-modal-title">Edit Encoder {modalEncoder.encoder_id} - {encoderModalDirection === 'ccw' ? 'Counter-Clockwise' : 'Clockwise'}</h3>
+                    <h3 id="encoder-modal-title">Edit Encoder L{modalEncoder.layer ?? selectedLayer} · {modalEncoder.encoder_id} - {encoderModalDirection === 'ccw' ? 'Counter-Clockwise' : 'Clockwise'}</h3>
                     <button class="modal-close" onclick={closeEncoderModal} aria-label="Close modal">
                         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
                             <line x1="18" y1="6" x2="6" y2="18" stroke="currentColor" stroke-width="2"/>
@@ -1506,6 +2071,112 @@
         margin: 0;
         color: #86868b;
         font-size: 14px;
+    }
+
+    .layer-toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        margin-bottom: 16px;
+    }
+
+    .layer-buttons {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+
+    .layer-button {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 10px 14px;
+        border-radius: 999px;
+        border: 1px solid rgba(0, 0, 0, 0.08);
+        background: #ffffff;
+        color: #1d1d1f;
+        font-size: 13px;
+        font-weight: 500;
+        cursor: pointer;
+        transition: all 0.2s ease;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+    }
+
+    .layer-button:hover {
+        border-color: rgba(0, 122, 255, 0.4);
+        box-shadow: 0 4px 12px rgba(0, 122, 255, 0.12);
+    }
+
+    .layer-button.current {
+        background: rgba(0, 122, 255, 0.12);
+        border-color: rgba(0, 122, 255, 0.5);
+        color: #0051d5;
+        box-shadow: 0 4px 12px rgba(0, 122, 255, 0.18);
+    }
+
+    .layer-button.active-hardware:not(.current) {
+        border-color: rgba(52, 199, 89, 0.35);
+        box-shadow: 0 4px 10px rgba(52, 199, 89, 0.16);
+    }
+
+    .layer-label {
+        letter-spacing: -0.2px;
+    }
+
+    .layer-pill {
+        padding: 2px 8px;
+        border-radius: 999px;
+        background: rgba(0, 122, 255, 0.12);
+        color: #0051d5;
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.3px;
+        text-transform: uppercase;
+    }
+
+    .layer-pill.inactive {
+        background: rgba(0, 0, 0, 0.06);
+        color: #6c6c70;
+    }
+
+    .layer-pill.active {
+        background: rgba(52, 199, 89, 0.18);
+        color: #22863a;
+    }
+
+    .layer-pill.momentary {
+        background: rgba(255, 159, 10, 0.18);
+        color: #a05a00;
+    }
+
+    .layer-state-controls {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        flex-wrap: wrap;
+    }
+
+    .layer-state-summary {
+        display: inline-flex;
+        align-items: center;
+        gap: 12px;
+        font-size: 13px;
+        color: #1d1d1f;
+        font-weight: 500;
+        padding: 6px 12px;
+        border-radius: 999px;
+        background: rgba(0, 0, 0, 0.04);
+    }
+
+    .momentary-indicator {
+        font-size: 13px;
+        color: #0051d5;
+        font-weight: 500;
+        background: rgba(0, 122, 255, 0.12);
+        padding: 6px 10px;
+        border-radius: 999px;
     }
 
     /* Connection Layout */

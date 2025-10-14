@@ -488,6 +488,7 @@ impl HidManager {
                 matrix_rows: 4,
                 matrix_cols: 4,
                 encoder_count: 2,
+                layer_count: 4,
                 i2c_devices: 0,
             });
         }
@@ -506,43 +507,48 @@ impl HidManager {
         DeviceInfo::from_payload(&response.payload[..response.payload_length as usize])
     }
 
-    /// Get keymap entry for specific row/col
-    pub async fn get_keymap_entry(&self, row: u8, col: u8) -> Result<KeymapEntry, String> {
+    /// Get keymap entry for specific layer/row/col
+    pub async fn get_keymap_entry(&self, layer: u8, row: u8, col: u8) -> Result<KeymapEntry, String> {
         // Handle mock device
         if *self.is_mock_device.lock().unwrap() {
             // Return mock keymap data - simple layout with letters
-            let keycode = match (row, col) {
-                (0, 0) => 0x04, // KC_A
-                (0, 1) => 0x05, // KC_B
-                (0, 2) => 0x06, // KC_C  
-                (0, 3) => 0x07, // KC_D
-                (1, 0) => 0x08, // KC_E
-                (1, 1) => 0x09, // KC_F
-                (1, 2) => 0x0A, // KC_G
-                (1, 3) => 0x0B, // KC_H
-                (2, 0) => 0x0C, // KC_I
-                (2, 1) => 0x0D, // KC_J
-                (2, 2) => 0x0E, // KC_K
-                (2, 3) => 0x0F, // KC_L
-                (3, 0) => 0x10, // KC_M
-                (3, 1) => 0x11, // KC_N
-                (3, 2) => 0x12, // KC_O
-                (3, 3) => 0x13, // KC_P
-                _ => 0x00, // KC_NO
+            let keycode = if layer == 0 {
+                match (row, col) {
+                    (0, 0) => 0x04, // KC_A
+                    (0, 1) => 0x05, // KC_B
+                    (0, 2) => 0x06, // KC_C  
+                    (0, 3) => 0x07, // KC_D
+                    (1, 0) => 0x08, // KC_E
+                    (1, 1) => 0x09, // KC_F
+                    (1, 2) => 0x0A, // KC_G
+                    (1, 3) => 0x0B, // KC_H
+                    (2, 0) => 0x0C, // KC_I
+                    (2, 1) => 0x0D, // KC_J
+                    (2, 2) => 0x0E, // KC_K
+                    (2, 3) => 0x0F, // KC_L
+                    (3, 0) => 0x10, // KC_M
+                    (3, 1) => 0x11, // KC_N
+                    (3, 2) => 0x12, // KC_O
+                    (3, 3) => 0x13, // KC_P
+                    _ => 0x00, // KC_NO
+                }
+            } else {
+                0x00
             };
             
             return Ok(KeymapEntry {
+                layer,
                 row,
                 col,
                 keycode,
             });
         }
         
-        let payload = [row, col];
+        let payload = [layer, row, col];
         let response = self.send_command(ConfigCommand::GetKeymap, &payload).await?;
         
-        println!("DEBUG get_keymap_entry: status_byte=0x{:02X}, sequence={}, payload_length={}", 
-                 response.status, response.sequence, response.payload_length);
+        println!("DEBUG get_keymap_entry: layer={} status_byte=0x{:02X}, sequence={}, payload_length={}", 
+                 layer, response.status, response.sequence, response.payload_length);
         
         let status = StatusCode::from(response.status);
         if !matches!(status, StatusCode::Ok) {
@@ -576,27 +582,33 @@ impl HidManager {
     pub async fn get_slave_keymap_entry(
         &self,
         slave_addr: u8,
+        layer: u8,
         row: u8,
         col: u8,
     ) -> Result<SlaveKeymapEntry, String> {
         // Handle mock device
         if *self.is_mock_device.lock().unwrap() {
             // Return mock slave keymap data
-            let keycode = match (row, col) {
-                (0, 0) => 0x04, // KC_A
-                (0, 1) => 0x05, // KC_B
-                _ => 0x00, // KC_NO
+            let keycode = if layer == 0 {
+                match (row, col) {
+                    (0, 0) => 0x04, // KC_A
+                    (0, 1) => 0x05, // KC_B
+                    _ => 0x00, // KC_NO
+                }
+            } else {
+                0x00
             };
             
             return Ok(SlaveKeymapEntry {
                 slave_addr,
+                layer,
                 row,
                 col,
                 keycode,
             });
         }
         
-        let payload = [slave_addr, row, col];
+        let payload = [slave_addr, layer, row, col];
         let response = self.send_command(ConfigCommand::GetSlaveKeymap, &payload).await?;
         
         let status = StatusCode::from(response.status);
@@ -630,11 +642,13 @@ impl HidManager {
     pub async fn get_slave_encoder_entry(
         &self,
         slave_addr: u8,
+        layer: u8,
         encoder_id: u8,
     ) -> Result<SlaveEncoderEntry, String> {
         if *self.is_mock_device.lock().unwrap() {
             return Ok(SlaveEncoderEntry {
                 slave_addr,
+                layer,
                 encoder_id,
                 ccw_keycode: 0x52,
                 cw_keycode: 0x51,
@@ -642,7 +656,7 @@ impl HidManager {
             });
         }
 
-        let payload = [slave_addr, encoder_id];
+        let payload = [slave_addr, layer, encoder_id];
         let response = self.send_command(ConfigCommand::GetSlaveEncoder, &payload).await?;
 
         let status = StatusCode::from(response.status);
@@ -684,6 +698,7 @@ impl HidManager {
                 matrix_rows: 2,
                 matrix_cols: 2,
                 encoder_count: 0,
+                layer_count: 4,
                 i2c_devices: 0,
             });
         }
@@ -700,7 +715,7 @@ impl HidManager {
     }
 
     /// Get encoder mapping
-    pub async fn get_encoder_entry(&self, encoder_id: u8) -> Result<EncoderEntry, String> {
+    pub async fn get_encoder_entry(&self, layer: u8, encoder_id: u8) -> Result<EncoderEntry, String> {
         // Handle mock device
         if *self.is_mock_device.lock().unwrap() {
             let (ccw_keycode, cw_keycode) = match encoder_id {
@@ -710,6 +725,7 @@ impl HidManager {
             };
             
             return Ok(EncoderEntry {
+                layer,
                 encoder_id,
                 ccw_keycode,
                 cw_keycode,
@@ -717,11 +733,11 @@ impl HidManager {
             });
         }
         
-        let payload = [encoder_id];
+        let payload = [layer, encoder_id];
         let response = self.send_command(ConfigCommand::GetEncoderMap, &payload).await?;
         
-        println!("DEBUG get_encoder_entry: status_byte=0x{:02X}, sequence={}, payload_length={}", 
-                 response.status, response.sequence, response.payload_length);
+        println!("DEBUG get_encoder_entry: layer={} status_byte=0x{:02X}, sequence={}, payload_length={}", 
+                 layer, response.status, response.sequence, response.payload_length);
         
         let status = StatusCode::from(response.status);
         if !matches!(status, StatusCode::Ok) {
@@ -749,6 +765,40 @@ impl HidManager {
         }
 
         Ok(())
+    }
+
+    /// Set active layer state (mask/default) and return applied values
+    pub async fn set_layer_state(&self, state: &LayerState) -> Result<LayerState, String> {
+        if *self.is_mock_device.lock().unwrap() {
+            return Ok(state.clone());
+        }
+
+        let payload = state.to_payload();
+        let response = self.send_command(ConfigCommand::SetLayerState, &payload).await?;
+        let status = StatusCode::from(response.status);
+        if !matches!(status, StatusCode::Ok) {
+            return Err(format!("Device returned error: {:?}", status));
+        }
+
+        LayerState::from_payload(&response.payload[..response.payload_length as usize])
+    }
+
+    /// Retrieve current layer state (active mask/default layer)
+    pub async fn get_layer_state(&self) -> Result<LayerState, String> {
+        if *self.is_mock_device.lock().unwrap() {
+            return Ok(LayerState {
+                active_mask: 0x01,
+                default_layer: 0,
+            });
+        }
+
+        let response = self.send_command(ConfigCommand::GetLayerState, &[]).await?;
+        let status = StatusCode::from(response.status);
+        if !matches!(status, StatusCode::Ok) {
+            return Err(format!("Device returned error: {:?}", status));
+        }
+
+        LayerState::from_payload(&response.payload[..response.payload_length as usize])
     }
 
     /// Save configuration to EEPROM
