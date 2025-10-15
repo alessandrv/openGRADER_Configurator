@@ -10,6 +10,7 @@ pub struct Keycode {
     pub category: String,
 }
 
+#[allow(dead_code)]
 pub fn get_keycode_map() -> HashMap<u16, Keycode> {
     let mut map = HashMap::new();
     
@@ -92,12 +93,42 @@ pub fn get_keycode_map() -> HashMap<u16, Keycode> {
     map.insert(0x0043, Keycode { code: 0x0043, name: "KC_F10".to_string(), display_name: "F10".to_string(), category: "Function".to_string() });
     map.insert(0x0044, Keycode { code: 0x0044, name: "KC_F11".to_string(), display_name: "F11".to_string(), category: "Function".to_string() });
     map.insert(0x0045, Keycode { code: 0x0045, name: "KC_F12".to_string(), display_name: "F12".to_string(), category: "Function".to_string() });
+    map.insert(0x0039, Keycode { code: 0x0039, name: "KC_CAPSLOCK".to_string(), display_name: "Caps Lock".to_string(), category: "Special".to_string() });
+    map.insert(0x0046, Keycode { code: 0x0046, name: "KC_PSCR".to_string(), display_name: "Print Screen".to_string(), category: "Function".to_string() });
+    map.insert(0x0047, Keycode { code: 0x0047, name: "KC_SCRL".to_string(), display_name: "Scroll Lock".to_string(), category: "Function".to_string() });
+    map.insert(0x0048, Keycode { code: 0x0048, name: "KC_PAUS".to_string(), display_name: "Pause".to_string(), category: "Function".to_string() });
+    map.insert(0x0049, Keycode { code: 0x0049, name: "KC_INSERT".to_string(), display_name: "Insert".to_string(), category: "Navigation".to_string() });
+    map.insert(0x004A, Keycode { code: 0x004A, name: "KC_HOME".to_string(), display_name: "Home".to_string(), category: "Navigation".to_string() });
+    map.insert(0x004B, Keycode { code: 0x004B, name: "KC_PGUP".to_string(), display_name: "Page Up".to_string(), category: "Navigation".to_string() });
+    map.insert(0x004C, Keycode { code: 0x004C, name: "KC_DELETE".to_string(), display_name: "Delete".to_string(), category: "Navigation".to_string() });
+    map.insert(0x004D, Keycode { code: 0x004D, name: "KC_END".to_string(), display_name: "End".to_string(), category: "Navigation".to_string() });
+    map.insert(0x004E, Keycode { code: 0x004E, name: "KC_PGDOWN".to_string(), display_name: "Page Down".to_string(), category: "Navigation".to_string() });
     
     // Arrow keys
     map.insert(0x004F, Keycode { code: 0x004F, name: "KC_RIGHT".to_string(), display_name: "→".to_string(), category: "Navigation".to_string() });
     map.insert(0x0050, Keycode { code: 0x0050, name: "KC_LEFT".to_string(), display_name: "←".to_string(), category: "Navigation".to_string() });
     map.insert(0x0051, Keycode { code: 0x0051, name: "KC_DOWN".to_string(), display_name: "↓".to_string(), category: "Navigation".to_string() });
     map.insert(0x0052, Keycode { code: 0x0052, name: "KC_UP".to_string(), display_name: "↑".to_string(), category: "Navigation".to_string() });
+
+    // Keypad keys
+    map.insert(0x0053, Keycode { code: 0x0053, name: "KC_NUMLOCK".to_string(), display_name: "Num Lock".to_string(), category: "Keypad".to_string() });
+    map.insert(0x0054, Keycode { code: 0x0054, name: "KC_KP_SLASH".to_string(), display_name: "Keypad /".to_string(), category: "Keypad".to_string() });
+    map.insert(0x0055, Keycode { code: 0x0055, name: "KC_KP_ASTERISK".to_string(), display_name: "Keypad *".to_string(), category: "Keypad".to_string() });
+    map.insert(0x0056, Keycode { code: 0x0056, name: "KC_KP_MINUS".to_string(), display_name: "Keypad -".to_string(), category: "Keypad".to_string() });
+    map.insert(0x0057, Keycode { code: 0x0057, name: "KC_KP_PLUS".to_string(), display_name: "Keypad +".to_string(), category: "Keypad".to_string() });
+    map.insert(0x0058, Keycode { code: 0x0058, name: "KC_KP_ENTER".to_string(), display_name: "Keypad Enter".to_string(), category: "Keypad".to_string() });
+    map.insert(0x0059, Keycode { code: 0x0059, name: "KC_KP_1".to_string(), display_name: "Keypad 1".to_string(), category: "Keypad".to_string() });
+    map.insert(0x005A, Keycode { code: 0x005A, name: "KC_KP_2".to_string(), display_name: "Keypad 2".to_string(), category: "Keypad".to_string() });
+    map.insert(0x005B, Keycode { code: 0x005B, name: "KC_KP_3".to_string(), display_name: "Keypad 3".to_string(), category: "Keypad".to_string() });
+    map.insert(0x005C, Keycode { code: 0x005C, name: "KC_KP_4".to_string(), display_name: "Keypad 4".to_string(), category: "Keypad".to_string() });
+    map.insert(0x005D, Keycode { code: 0x005D, name: "KC_KP_5".to_string(), display_name: "Keypad 5".to_string(), category: "Keypad".to_string() });
+    map.insert(0x005E, Keycode { code: 0x005E, name: "KC_KP_6".to_string(), display_name: "Keypad 6".to_string(), category: "Keypad".to_string() });
+    map.insert(0x005F, Keycode { code: 0x005F, name: "KC_KP_7".to_string(), display_name: "Keypad 7".to_string(), category: "Keypad".to_string() });
+    map.insert(0x0060, Keycode { code: 0x0060, name: "KC_KP_8".to_string(), display_name: "Keypad 8".to_string(), category: "Keypad".to_string() });
+    map.insert(0x0061, Keycode { code: 0x0061, name: "KC_KP_9".to_string(), display_name: "Keypad 9".to_string(), category: "Keypad".to_string() });
+    map.insert(0x0062, Keycode { code: 0x0062, name: "KC_KP_0".to_string(), display_name: "Keypad 0".to_string(), category: "Keypad".to_string() });
+    map.insert(0x0063, Keycode { code: 0x0063, name: "KC_KP_DOT".to_string(), display_name: "Keypad .".to_string(), category: "Keypad".to_string() });
+    map.insert(0x0065, Keycode { code: 0x0065, name: "KC_APP".to_string(), display_name: "Menu".to_string(), category: "Modifiers".to_string() });
     
     // Modifiers
     map.insert(0x00E0, Keycode { code: 0x00E0, name: "KC_LEFT_CTRL".to_string(), display_name: "L Ctrl".to_string(), category: "Modifiers".to_string() });
@@ -118,6 +149,7 @@ pub fn get_keycode_map() -> HashMap<u16, Keycode> {
 }
 
 // Helper to generate a user-friendly display for OP MIDI codes
+#[allow(dead_code)]
 pub fn describe_op_midi(code: u16) -> Option<String> {
     if code < 0x7E10 { return None; }
     // decode: base + (channel-1)<<11 + controller<<4 + index
@@ -138,10 +170,12 @@ pub fn describe_op_midi(code: u16) -> Option<String> {
 }
 
 // Function without tauri::command decorator to avoid duplicate
+#[allow(dead_code)]
 pub fn get_keycodes() -> HashMap<u16, Keycode> {
     get_keycode_map()
 }
 
+#[allow(dead_code)]
 pub fn get_keycode_name(code: u16) -> String {
     let map = get_keycode_map();
     match map.get(&code) {
@@ -156,6 +190,7 @@ pub fn get_keycode_name(code: u16) -> String {
     }
 }
 
+#[allow(dead_code)]
 pub fn find_keycode_by_name(name: &str) -> Option<u16> {
     let map = get_keycode_map();
     map.iter()

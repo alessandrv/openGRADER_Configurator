@@ -36,6 +36,7 @@
     let boardLayout = $state(null);
     let activeEncoderMenu = $state(null);
     let keycodes = {};
+    let keycodeByName = {};
     
     // UI state
     let selectedTab = $state('keymap');
@@ -268,19 +269,21 @@
             }
 
             keycodes = mapped;
+            keycodeByName = {};
+            for (const entry of Object.values(mapped)) {
+                if (entry?.name) {
+                    keycodeByName[entry.name] = entry.code;
+                }
+            }
         } catch (e) {
             console.error('Failed to load keycodes:', e);
         }
     }
 
     function updateLayerCountForDevice(deviceId) {
-        if (deviceId === 'main') {
-            layerCount = Math.max(deviceInfo?.layer_count ?? keymap.length ?? 1, 1);
-        } else {
-            const addr = parseInt(deviceId, 10);
-            const layers = slaveKeymaps[addr];
-            layerCount = Math.max(layers ? layers.length : 1, 1);
-        }
+        // Always use the master's layer count - all devices are synced to the same layers
+        layerCount = Math.max(deviceInfo?.layer_count ?? keymap.length ?? 1, 1);
+        
         const clampedSelected = clampLayerIndex(selectedLayer);
         if (clampedSelected !== selectedLayer) {
             selectedLayer = clampedSelected;
@@ -299,10 +302,8 @@
     function setSelectedDevice(deviceId) {
         if (selectedDevice !== deviceId) {
             selectedDevice = deviceId;
-            selectedLayer = 0;
-            hardwareActiveLayer = 0;
-            manualLayerOverride = false;
-            baselineLayerMask = bitForLayer(0) || 1;
+            // Don't reset layer when switching devices - keep the current layer
+            // because master and slaves are always in sync
             updateLayerCountForDevice(deviceId);
         }
     }
@@ -329,6 +330,19 @@
             return 0;
         }
         return 1 << index;
+    }
+
+    function highestActiveLayer(maskValue) {
+        if (!Number.isFinite(maskValue)) {
+            return 0;
+        }
+        const limit = Math.min(layerCount, 8);
+        for (let i = limit - 1; i >= 0; i--) {
+            if ((maskValue & bitForLayer(i)) !== 0) {
+                return i;
+            }
+        }
+        return 0;
     }
 
     function validLayerMask(mask) {
@@ -360,10 +374,7 @@
         }
 
         const normalizedDefault = clampLayerIndex(state.default_layer ?? 0);
-        const normalizedMask = validLayerMask(state.active_mask ?? 0);
-        const activeLayers = extractActiveLayers(normalizedMask);
-        const stableLayer = activeLayers.length > 0 ? clampLayerIndex(activeLayers[0]) : normalizedDefault;
-        const stableMask = bitForLayer(stableLayer) || 1;
+        const stableMask = bitForLayer(normalizedDefault) || 1;
 
         return {
             active_mask: stableMask,
@@ -385,63 +396,76 @@
             return;
         }
 
-        const previousMask = layerState?.active_mask ?? null;
-        const previousDefault = layerState?.default_layer ?? null;
-        const previousHardware = hardwareActiveLayer;
-
         const normalizedDefault = clampLayerIndex(state.default_layer ?? 0);
         let mask = validLayerMask(state.active_mask ?? 0);
-
         if (mask === 0) {
             mask = bitForLayer(normalizedDefault) || 1;
         }
 
-        const activeLayers = extractActiveLayers(mask);
-        const highestLayer = clampLayerIndex(activeLayers.length > 0 ? activeLayers[activeLayers.length - 1] : normalizedDefault);
+        const previousMask = layerState?.active_mask ?? null;
+        const previousDefault = layerState?.default_layer ?? null;
+        const previousHardware = hardwareActiveLayer;
 
-        let newBaselineMask = baselineLayerMask;
+        let baseMask = baselineLayerMask;
+
+        if (baseMask === 0 && mask !== 0) {
+            baseMask = mask;
+        }
+
+        const removedBits = baselineLayerMask & ~mask;
+        if (removedBits) {
+            baseMask = mask;
+        }
+
+        let addedBits = mask & ~baseMask;
         let newMomentaryLayer = null;
 
-        if (activeLayers.length <= 1) {
-            newBaselineMask = mask;
-            lastStableLayer = highestLayer;
-            newMomentaryLayer = null;
+        if (addedBits) {
+            newMomentaryLayer = highestActiveLayer(addedBits);
         } else {
-            const highestBit = bitForLayer(highestLayer);
-            if ((newBaselineMask & highestBit) === 0) {
-                newMomentaryLayer = highestLayer;
-            } else {
-                newMomentaryLayer = null;
-            }
+            baseMask = mask;
         }
 
-        baselineLayerMask = newBaselineMask;
+        baselineLayerMask = baseMask;
+
+        if (newMomentaryLayer !== null && !Number.isFinite(newMomentaryLayer)) {
+            newMomentaryLayer = null;
+        }
+
+        if (newMomentaryLayer !== null && (newMomentaryLayer < 0 || newMomentaryLayer >= layerCount)) {
+            newMomentaryLayer = null;
+        }
+
         momentaryLayer = newMomentaryLayer;
+
+        const baseLayer = baseMask ? highestActiveLayer(baseMask) : normalizedDefault;
+        const activeLayer = momentaryLayer !== null ? momentaryLayer : baseLayer;
+
         if (momentaryLayer === null) {
-            lastStableLayer = highestLayer;
+            lastStableLayer = baseLayer;
         }
 
-        hardwareActiveLayer = highestLayer;
+        hardwareActiveLayer = activeLayer;
 
         const clampedSelection = clampLayerIndex(selectedLayer);
         if (clampedSelection !== selectedLayer) {
             selectedLayer = clampedSelection;
         }
 
-        const maskChanged = previousMask !== mask || previousDefault !== normalizedDefault || previousHardware !== highestLayer;
+        const maskChanged = previousMask !== mask || previousDefault !== normalizedDefault || previousHardware !== hardwareActiveLayer;
 
         if (fromDevice) {
             if (maskChanged) {
                 manualLayerOverride = false;
             }
             if (!manualLayerOverride || maskChanged) {
-                if (selectedLayer !== highestLayer) {
-                    selectedLayer = highestLayer;
+                if (selectedLayer !== hardwareActiveLayer) {
+                    selectedLayer = hardwareActiveLayer;
                 }
             }
         } else if (!manualLayerOverride) {
-            if (selectedLayer !== highestLayer) {
-                selectedLayer = highestLayer;
+            if (selectedLayer !== hardwareActiveLayer) {
+                selectedLayer = hardwareActiveLayer;
             }
         }
 
@@ -514,7 +538,9 @@
     }
 
     async function refreshLayerStateFromDevice() {
-        if (!isConnected || selectedDevice !== 'main') {
+        // Layer state is global and managed by the master, so always poll it
+        // even when viewing a slave device
+        if (!isConnected) {
             return;
         }
 
@@ -701,7 +727,14 @@
         try {
             console.log(`[loadSlaveKeymap] Invoking get_full_slave_keymap for slave 0x${slaveAddr.toString(16)}...`);
             const slaveKeymap = await invoke('get_full_slave_keymap', { slaveAddr: slaveAddr });
-            console.log(`[loadSlaveKeymap] Received ${slaveKeymap.length} keymap entries for slave ${slaveAddr}`);
+            console.log(`[loadSlaveKeymap] Received keymap with ${slaveKeymap.length} layers for slave ${slaveAddr}`);
+            
+            // Log details about each layer
+            slaveKeymap.forEach((layer, layerIdx) => {
+                const keyCount = layer.flat().filter(k => k.keycode !== 0).length;
+                console.log(`[loadSlaveKeymap] Layer ${layerIdx}: ${layer.length} rows, ${keyCount} non-zero keys`);
+            });
+            
             slaveKeymaps[slaveAddr] = slaveKeymap;
             slaveKeymaps = {...slaveKeymaps}; // trigger reactivity
             if (!originalSlaveKeymaps[String(slaveAddr)]) {
@@ -774,7 +807,9 @@
         } else {
             const slaveAddr = parseInt(selectedDevice, 10);
             const layers = slaveKeymaps[slaveAddr];
-            return layers?.[selectedLayer] ?? [];
+            const currentLayerKeymap = layers?.[selectedLayer] ?? [];
+            console.log(`[getCurrentKeymap] Slave ${slaveAddr}, Layer ${selectedLayer}: ${currentLayerKeymap.length} rows, total layers: ${layers?.length ?? 0}`);
+            return currentLayerKeymap;
         }
     }
 
@@ -784,12 +819,169 @@
         } else {
             const slaveAddr = parseInt(selectedDevice, 10);
             const layers = slaveEncoders[slaveAddr];
-            return layers?.[selectedLayer] ?? [];
+            const currentLayerEncoders = layers?.[selectedLayer] ?? [];
+            console.log(`[getCurrentEncoders] Slave ${slaveAddr}, Layer ${selectedLayer}: ${currentLayerEncoders.length} encoders, total layers: ${layers?.length ?? 0}`);
+            return currentLayerEncoders;
         }
     }
 
     function getCurrentLayout() {
         return boardLayout;
+    }
+    
+    // Debug helper to inspect slave layer data
+    function debugSlaveLayerData(slaveAddr) {
+        const layers = slaveKeymaps[slaveAddr];
+        if (!layers) {
+            console.log(`[DEBUG] No keymap loaded for slave ${slaveAddr}`);
+            return;
+        }
+        console.log(`[DEBUG] Slave ${slaveAddr} has ${layers.length} layers:`);
+        layers.forEach((layer, idx) => {
+            const allKeys = layer.flat();
+            const nonZeroKeys = allKeys.filter(k => k && k.keycode !== 0);
+            console.log(`  Layer ${idx}: ${layer.length} rows × ${layer[0]?.length ?? 0} cols, ${nonZeroKeys.length} programmed keys`);
+            if (nonZeroKeys.length > 0 && nonZeroKeys.length <= 10) {
+                nonZeroKeys.forEach(k => console.log(`    R${k.row}C${k.col} = 0x${k.keycode.toString(16)}`));
+            }
+        });
+    }
+
+    // TODO: Fix firmware to properly return slave layer data for all layers
+    // Currently the firmware is only returning layer 0 data for slaves
+    // The backend get_full_slave_keymap() is correctly iterating through all layers,
+    // but the firmware's get_slave_keymap_entry() is probably not reading the correct layer
+    
+    async function DISABLED_copyMasterToSlave(slaveAddr) {
+        if (!keymap || keymap.length === 0) {
+            error = 'No master keymap to copy';
+            return;
+        }
+
+        if (!confirm(`This will overwrite ALL layers of slave 0x${slaveAddr.toString(16).toUpperCase()} with the master's keymap. Continue?`)) {
+            return;
+        }
+
+        copyingToSlave = true;
+        error = null;
+
+        try {
+            console.log(`[copyMasterToSlave] Starting copy to slave ${slaveAddr}...`);
+            
+            // Get slave info to know its dimensions
+            const slaveInfo = await invoke('get_slave_info', { slaveAddr });
+            const slaveRows = slaveInfo.matrix_rows;
+            const slaveCols = slaveInfo.matrix_cols;
+            
+            let entriesWritten = 0;
+            let entriesSkipped = 0;
+
+            // Copy each layer from master to slave
+            for (let layer = 0; layer < keymap.length && layer < 8; layer++) {
+                const masterLayer = keymap[layer];
+                if (!masterLayer) continue;
+
+                for (let row = 0; row < Math.min(masterLayer.length, slaveRows); row++) {
+                    const masterRow = masterLayer[row];
+                    if (!masterRow) continue;
+
+                    for (let col = 0; col < Math.min(masterRow.length, slaveCols); col++) {
+                        const masterKey = masterRow[col];
+                        if (!masterKey) {
+                            entriesSkipped++;
+                            continue;
+                        }
+
+                        // Write to slave
+                        await invoke('set_slave_keymap_entry', {
+                            entry: {
+                                slave_addr: slaveAddr,
+                                layer,
+                                row,
+                                col,
+                                keycode: masterKey.keycode
+                            }
+                        });
+                        entriesWritten++;
+                    }
+                }
+                console.log(`[copyMasterToSlave] Copied layer ${layer} (${entriesWritten} entries so far)`);
+            }
+
+            console.log(`[copyMasterToSlave] Completed! Wrote ${entriesWritten} entries, skipped ${entriesSkipped}`);
+            
+            // Reload the slave keymap to show the changes
+            await loadSlaveKeymap(slaveAddr);
+            
+            error = null;
+        } catch (e) {
+            error = `Failed to copy keymap to slave: ${e}`;
+            console.error('[copyMasterToSlave] Error:', e);
+        } finally {
+            copyingToSlave = false;
+        }
+    }
+
+    // Copy master encoders to slave
+    async function DISABLED_copyMasterEncodersToSlave(slaveAddr) {
+        if (!encoders || encoders.length === 0) {
+            error = 'No master encoders to copy';
+            return;
+        }
+
+        if (!confirm(`This will overwrite ALL encoder layers of slave 0x${slaveAddr.toString(16).toUpperCase()} with the master's encoders. Continue?`)) {
+            return;
+        }
+
+        copyingToSlave = true;
+        error = null;
+
+        try {
+            console.log(`[copyMasterEncodersToSlave] Starting copy to slave ${slaveAddr}...`);
+            
+            // Get slave info to know how many encoders it has
+            const slaveInfo = await invoke('get_slave_info', { slaveAddr });
+            const slaveEncoderCount = slaveInfo.encoder_count;
+            
+            let entriesWritten = 0;
+
+            // Copy each layer's encoders from master to slave
+            for (let layer = 0; layer < encoders.length && layer < 8; layer++) {
+                const masterLayerEncoders = encoders[layer];
+                if (!masterLayerEncoders) continue;
+
+                for (let encoderId = 0; encoderId < Math.min(masterLayerEncoders.length, slaveEncoderCount); encoderId++) {
+                    const masterEncoder = masterLayerEncoders[encoderId];
+                    if (!masterEncoder) continue;
+
+                    // Write to slave
+                    await invoke('set_slave_encoder_entry', {
+                        entry: {
+                            slave_addr: slaveAddr,
+                            layer,
+                            encoder_id: encoderId,
+                            ccw_keycode: masterEncoder.ccw_keycode,
+                            cw_keycode: masterEncoder.cw_keycode,
+                            reserved: 0
+                        }
+                    });
+                    entriesWritten++;
+                }
+                console.log(`[copyMasterEncodersToSlave] Copied layer ${layer} encoders (${entriesWritten} entries so far)`);
+            }
+
+            console.log(`[copyMasterEncodersToSlave] Completed! Wrote ${entriesWritten} encoder entries`);
+            
+            // Reload the slave encoders to show the changes
+            await loadSlaveEncoders(slaveAddr);
+            
+            error = null;
+        } catch (e) {
+            error = `Failed to copy encoders to slave: ${e}`;
+            console.error('[copyMasterEncodersToSlave] Error:', e);
+        } finally {
+            copyingToSlave = false;
+        }
     }
 
     function isEncoderCell(row, col) {
@@ -1056,6 +1248,190 @@
 
     // MIDI encoding helpers
     const OP_MIDI_CC_BASE = 0x7E10;
+
+    const standardKeyCategories = new Set([
+        'Letters',
+        'Numbers',
+        'Punctuation',
+        'Function',
+        'Navigation',
+        'Modifiers',
+        'Keypad'
+    ]);
+
+    const STANDARD_KEY_LAYOUT = [
+        {
+            offset: 0,
+            keys: [
+                { code: 'KC_ESCAPE', legend: ['Esc'] },
+                { spacer: 1 },
+                { code: 'KC_F1', legend: ['F1'] },
+                { code: 'KC_F2', legend: ['F2'] },
+                { code: 'KC_F3', legend: ['F3'] },
+                { code: 'KC_F4', legend: ['F4'] },
+                { spacer: 0.5 },
+                { code: 'KC_F5', legend: ['F5'] },
+                { code: 'KC_F6', legend: ['F6'] },
+                { code: 'KC_F7', legend: ['F7'] },
+                { code: 'KC_F8', legend: ['F8'] },
+                { spacer: 0.5 },
+                { code: 'KC_F9', legend: ['F9'] },
+                { code: 'KC_F10', legend: ['F10'] },
+                { code: 'KC_F11', legend: ['F11'] },
+                { code: 'KC_F12', legend: ['F12'] },
+                { spacer: 0.25 },
+                { code: 'KC_PSCR', legend: ['PrtSc'] },
+                { code: 'KC_SCRL', legend: ['Scroll', 'Lock'] },
+                { code: 'KC_PAUS', legend: ['Pause', 'Break'] }
+            ]
+        },
+        {
+            offset: 0.5,
+            keys: [
+                { code: 'KC_GRAVE', legend: ['~', '`'] },
+                { code: 'KC_1', legend: ['!', '1'] },
+                { code: 'KC_2', legend: ['@', '2'] },
+                { code: 'KC_3', legend: ['#', '3'] },
+                { code: 'KC_4', legend: ['$', '4'] },
+                { code: 'KC_5', legend: ['%', '5'] },
+                { code: 'KC_6', legend: ['^', '6'] },
+                { code: 'KC_7', legend: ['&', '7'] },
+                { code: 'KC_8', legend: ['*', '8'] },
+                { code: 'KC_9', legend: ['(', '9'] },
+                { code: 'KC_0', legend: [')', '0'] },
+                { code: 'KC_MINUS', legend: ['_', '-'] },
+                { code: 'KC_EQUAL', legend: ['+', '='] },
+                { code: 'KC_BACKSPACE', legend: ['Backspace'], width: 2 },
+                { spacer: 0.25 },
+                { code: 'KC_INSERT', legend: ['Insert'] },
+                { code: 'KC_HOME', legend: ['Home'] },
+                { code: 'KC_PGUP', legend: ['PgUp'] },
+                { spacer: 0.25 },
+                { code: 'KC_NUMLOCK', legend: ['Num', 'Lock'] },
+                { code: 'KC_KP_SLASH', legend: ['/'] },
+                { code: 'KC_KP_ASTERISK', legend: ['*'] },
+                { code: 'KC_KP_MINUS', legend: ['-'] }
+            ]
+        },
+        {
+            offset: 0,
+            keys: [
+                { code: 'KC_TAB', legend: ['Tab'], width: 1.5 },
+                { code: 'KC_Q', legend: ['Q'] },
+                { code: 'KC_W', legend: ['W'] },
+                { code: 'KC_E', legend: ['E'] },
+                { code: 'KC_R', legend: ['R'] },
+                { code: 'KC_T', legend: ['T'] },
+                { code: 'KC_Y', legend: ['Y'] },
+                { code: 'KC_U', legend: ['U'] },
+                { code: 'KC_I', legend: ['I'] },
+                { code: 'KC_O', legend: ['O'] },
+                { code: 'KC_P', legend: ['P'] },
+                { code: 'KC_LEFT_BRACKET', legend: ['{', '['] },
+                { code: 'KC_RIGHT_BRACKET', legend: ['}', ']'] },
+                { code: 'KC_BACKSLASH', legend: ['|', '\\'], width: 1.5 },
+                { spacer: 0.25 },
+                { code: 'KC_DELETE', legend: ['Delete'] },
+                { code: 'KC_END', legend: ['End'] },
+                { code: 'KC_PGDN', legend: ['PgDn'] },
+                { spacer: 0.25 },
+                { code: 'KC_KP_7', legend: ['7', 'Home'] },
+                { code: 'KC_KP_8', legend: ['8', '↑'] },
+                { code: 'KC_KP_9', legend: ['9', 'PgUp'] },
+                { code: 'KC_KP_PLUS', legend: ['+'], height: 2 }
+            ]
+        },
+        {
+            offset: 0,
+            keys: [
+                { code: 'KC_CAPSLOCK', legend: ['Caps', 'Lock'], width: 1.75 },
+                { code: 'KC_A', legend: ['A'] },
+                { code: 'KC_S', legend: ['S'] },
+                { code: 'KC_D', legend: ['D'] },
+                { code: 'KC_F', legend: ['F'] },
+                { code: 'KC_G', legend: ['G'] },
+                { code: 'KC_H', legend: ['H'] },
+                { code: 'KC_J', legend: ['J'] },
+                { code: 'KC_K', legend: ['K'] },
+                { code: 'KC_L', legend: ['L'] },
+                { code: 'KC_SEMICOLON', legend: [':', ';'] },
+                { code: 'KC_QUOTE', legend: ["\"", "'"] },
+                { code: 'KC_ENTER', legend: ['Enter'], width: 2.25 },
+                { spacer: 3.5 },
+                { code: 'KC_KP_4', legend: ['4', '←'] },
+                { code: 'KC_KP_5', legend: ['5'] },
+                { code: 'KC_KP_6', legend: ['6', '→'] }
+            ]
+        },
+        {
+            offset: 0,
+            keys: [
+                { code: 'KC_LEFT_SHIFT', legend: ['Shift'], width: 2.25 },
+                { code: 'KC_Z', legend: ['Z'] },
+                { code: 'KC_X', legend: ['X'] },
+                { code: 'KC_C', legend: ['C'] },
+                { code: 'KC_V', legend: ['V'] },
+                { code: 'KC_B', legend: ['B'] },
+                { code: 'KC_N', legend: ['N'] },
+                { code: 'KC_M', legend: ['M'] },
+                { code: 'KC_COMMA', legend: ['<', ','] },
+                { code: 'KC_DOT', legend: ['>', '.'] },
+                { code: 'KC_SLASH', legend: ['?', '/'] },
+                { code: 'KC_RIGHT_SHIFT', legend: ['Shift'], width: 2.75 },
+                { spacer: 1.25 },
+                { code: 'KC_UP', legend: ['↑'] },
+                { spacer: 1.25 },
+                { code: 'KC_KP_1', legend: ['1', 'End'] },
+                { code: 'KC_KP_2', legend: ['2', '↓'] },
+                { code: 'KC_KP_3', legend: ['3', 'PgDn'] },
+                { code: 'KC_KP_ENTER', legend: ['Enter'], height: 2 }
+            ]
+        },
+        {
+            offset: 0,
+            keys: [
+                { code: 'KC_LEFT_CTRL', legend: ['Ctrl'], width: 1.25 },
+                { code: 'KC_LEFT_GUI', legend: ['Win'], width: 1.25 },
+                { code: 'KC_LEFT_ALT', legend: ['Alt'], width: 1.25 },
+                { code: 'KC_SPACE', legend: ['Space'], width: 6.25 },
+                { code: 'KC_RIGHT_ALT', legend: ['Alt'], width: 1.25 },
+                { code: 'KC_RIGHT_GUI', legend: ['Win'], width: 1.25 },
+                { code: 'KC_APP', legend: ['Menu'], width: 1.25 },
+                { code: 'KC_RIGHT_CTRL', legend: ['Ctrl'], width: 1.25 },
+                { spacer: 0.25 },
+                { code: 'KC_LEFT', legend: ['←'] },
+                { code: 'KC_DOWN', legend: ['↓'] },
+                { code: 'KC_RIGHT', legend: ['→'] },
+                { spacer: 0.25 },
+                { code: 'KC_KP_0', legend: ['0', 'Ins'], width: 2 },
+                { code: 'KC_KP_DOT', legend: ['.', 'Del'] }
+            ]
+        }
+    ];
+
+    function lookupKeycodeByName(name) {
+        if (!name) {
+            return null;
+        }
+        return keycodeByName?.[name] ?? null;
+    }
+
+    function resolvedStandardKeyLayout() {
+        return STANDARD_KEY_LAYOUT.map((row) => ({
+            offset: row.offset ?? 0,
+            keys: row.keys.map((item) => {
+                if (item.spacer !== undefined) {
+                    return item;
+                }
+                const codeValue = item.code ? lookupKeycodeByName(item.code) ?? null : null;
+                return {
+                    ...item,
+                    codeValue
+                };
+            })
+        }));
+    }
+
     
     function midiValueIndex(value) {
         const values = [0, 1, 7, 15, 31, 43, 45, 63, 64, 79, 95, 111, 120, 127, 50, 100];
@@ -1084,7 +1460,8 @@
                 layer,
                 label: `Change layer (${layer})`,
                 name: `KC_TO(${layer})`,
-                category: 'Layers'
+                category: 'Layers',
+                kind: 'persistent'
             };
         }
         if (code >= OP_MOMENTARY_BASE && code <= OP_MOMENTARY_MAX) {
@@ -1092,7 +1469,8 @@
                 layer,
                 label: `Momentary layer (${layer})`,
                 name: `KC_MO(${layer})`,
-                category: 'Layers'
+                category: 'Layers',
+                kind: 'momentary'
             };
         }
         return null;
@@ -1125,36 +1503,6 @@
         return [`0x${code.toString(16).toUpperCase().padStart(4, '0')}`];
     }
 
-    function getLayerKeyOptions() {
-        const maxLayers = Math.max(layerCount ?? 1, 1);
-        const options = [];
-        const limit = Math.min(maxLayers, OP_LAYER_ID_MASK + 1);
-        for (let layer = 0; layer < limit; layer++) {
-            const toCode = OP_TO_BASE + layer;
-            const toInfo = layerKeycodeInfo(toCode);
-            if (toInfo) {
-                options.push({
-                    value: toCode,
-                    label: toInfo.label,
-                    name: toInfo.name,
-                    category: toInfo.category
-                });
-            }
-
-            const moCode = OP_MOMENTARY_BASE + layer;
-            const moInfo = layerKeycodeInfo(moCode);
-            if (moInfo) {
-                options.push({
-                    value: moCode,
-                    label: moInfo.label,
-                    name: moInfo.name,
-                    category: moInfo.category
-                });
-            }
-        }
-        return options;
-    }
-
     function getKeycodeOptions() {
         const baseOptions = Object.entries(keycodes).map(([code, keycode]) => ({
             value: parseInt(code),
@@ -1164,7 +1512,7 @@
         }));
 
         const merged = new Map();
-        for (const option of [...baseOptions, ...getLayerKeyOptions()]) {
+        for (const option of baseOptions) {
             if (!merged.has(option.value)) {
                 merged.set(option.value, option);
             }
@@ -1188,7 +1536,25 @@
     // Modal handlers
     function openKeyModal(row, col, keycode) {
         modalKey = { row, col, keycode, layer: selectedLayer };
-        keyModalTab = 'standard';
+        const info = layerKeycodeInfo(keycode);
+        const limit = layerKeyLimit();
+
+        if (info) {
+            layerKeyType = info.kind === 'momentary' ? 'momentary' : 'persistent';
+            let target = Number(info.layer ?? 0);
+            if (!Number.isFinite(target)) {
+                target = 0;
+            }
+            target = Math.max(0, Math.min(target, limit - 1));
+            layerKeyLayer = target;
+            keyModalTab = 'layer';
+        } else {
+            layerKeyType = 'persistent';
+            let defaultLayer = clampLayerIndex(selectedLayer);
+            defaultLayer = Math.max(0, Math.min(defaultLayer, limit - 1));
+            layerKeyLayer = defaultLayer;
+            keyModalTab = 'standard';
+        }
         showKeyModal = true;
         activeEncoderMenu = null;
     }
@@ -1231,6 +1597,60 @@
             );
             closeEncoderModal();
         }
+    }
+
+    // Layer switch form state
+    let layerKeyType = $state('persistent');
+    let layerKeyLayer = $state(0);
+
+    function layerKeyLimit() {
+        const total = Number.isFinite(layerCount) ? layerCount : 1;
+        const bounded = Math.min(Math.max(total, 1), OP_LAYER_ID_MASK + 1);
+        return bounded;
+    }
+
+    function layerKeySelectableIndices() {
+        const limit = layerKeyLimit();
+        return Array.from({ length: limit }, (_, i) => i);
+    }
+
+    function updateLayerKeySelection() {
+        const limit = layerKeyLimit();
+        let chosen = Number(layerKeyLayer);
+        if (!Number.isFinite(chosen)) {
+            chosen = 0;
+        }
+        chosen = Math.max(0, Math.min(chosen, limit - 1));
+        layerKeyLayer = chosen;
+
+        const base = layerKeyType === 'momentary' ? OP_MOMENTARY_BASE : OP_TO_BASE;
+        const code = base + chosen;
+        if (modalKey) {
+            modalKey.keycode = code;
+            modalKey = modalKey; // trigger reactivity
+        }
+    }
+
+    function initLayerTab() {
+        const info = modalKey ? layerKeycodeInfo(modalKey.keycode) : null;
+        const limit = layerKeyLimit();
+
+        if (info) {
+            layerKeyType = info.kind === 'momentary' ? 'momentary' : 'persistent';
+            let target = Number(info.layer ?? 0);
+            if (!Number.isFinite(target)) {
+                target = 0;
+            }
+            target = Math.max(0, Math.min(target, limit - 1));
+            layerKeyLayer = target;
+            return;
+        }
+
+        layerKeyType = 'persistent';
+        let defaultLayer = clampLayerIndex(selectedLayer);
+        defaultLayer = Math.max(0, Math.min(defaultLayer, limit - 1));
+        layerKeyLayer = defaultLayer;
+        updateLayerKeySelection();
     }
 
     // MIDI form state
@@ -1311,28 +1731,12 @@
             <div class="header-content">
                 <div class="logo-section">
                     <div class="logo">
-                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                            <path d="M3 7H21L19 2H5L3 7Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                            <path d="M3 7L5 22H19L21 7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                            <path d="M9 12H15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-                        </svg>
+                        
                     </div>
                     <h1 class="title">openGRADER Configurator</h1>
                 </div>
                 
-                <div class="connection-status">
-                    {#if isConnected}
-                        <div class="status-indicator connected">
-                            <div class="status-dot"></div>
-                            <span>Connected</span>
-                        </div>
-                    {:else}
-                        <div class="status-indicator disconnected">
-                            <div class="status-dot"></div>
-                            <span>Disconnected</span>
-                        </div>
-                    {/if}
-                </div>
+               
             </div>
         </header>
 
@@ -1444,19 +1848,17 @@
                                     class:active-hardware={hardwareActiveLayer === layerIndex}
                                     onclick={() => selectLayer(layerIndex)}
                                 >
-                                    <span class="layer-label">Layer {layerIndex}</span>
+                                    <span class="layer-label">L:{layerIndex}</span>
                                     {#if isDefaultLayer(layerIndex)}
-                                        <span class="layer-pill">Default</span>
+                                        <span class="layer-pill">D</span>
                                     {/if}
                                     {#if hardwareActiveLayer === layerIndex}
-                                        <span class="layer-pill active">Active</span>
+                                        <span class="layer-pill active">A</span>
                                     {/if}
                                     {#if momentaryLayer === layerIndex}
-                                        <span class="layer-pill momentary">Momentary</span>
+                                        <span class="layer-pill momentary">M</span>
                                     {/if}
-                                    {#if !isLayerActive(layerIndex)}
-                                        <span class="layer-pill inactive">Inactive</span>
-                                    {/if}
+                                    
                                 </button>
                             {/each}
                         </div>
@@ -1479,11 +1881,7 @@
                                 >
                                     Set as Default
                                 </button>
-                                <div class="layer-state-summary">
-                                    <span>Active {hardwareActiveLayer}</span>
-                                    <span>Default {layerState?.default_layer ?? 0}</span>
-                                    <span>Editing {selectedLayer}</span>
-                                </div>
+                               
                                 {#if momentaryLayer !== null}
                                     <div class="momentary-indicator">
                                         Momentary layer {momentaryLayer}
@@ -1644,6 +2042,16 @@
                     </button>
                     <button 
                         class="modal-tab"
+                        class:active={keyModalTab === 'layer'}
+                        onclick={() => {
+                            keyModalTab = 'layer';
+                            initLayerTab();
+                        }}
+                    >
+                        Layer Switch
+                    </button>
+                    <button 
+                        class="modal-tab"
                         class:active={keyModalTab === 'midi'}
                         onclick={() => keyModalTab = 'midi'}
                     >
@@ -1653,23 +2061,108 @@
 
                 <div class="modal-body">
                     {#if keyModalTab === 'standard'}
-                        <div class="keycode-selector">
-                            {#each Object.entries(getKeycodesByCategory()) as [category, options]}
-                                <div class="keycode-category">
-                                    <h4 class="category-title">{category}</h4>
-                                    <div class="keycode-grid">
-                                        {#each options as option}
+                        <div
+                            class="standard-key-layout"
+                            style="--key-unit: clamp(34px, (min(100vw, 1180px) - 220px) / 18.5, 48px);"
+                        >
+                            {#each resolvedStandardKeyLayout() as row}
+                                <div
+                                    class="standard-key-row"
+                                    style={`margin-left: calc(var(--key-unit) * ${(row.offset ?? 0)})`}
+                                >
+                                    {#each row.keys as item}
+                                        {#if item.spacer !== undefined}
+                                            <div
+                                                class="standard-key-spacer"
+                                                style={`width: calc(var(--key-unit) * ${item.spacer}); height: calc(var(--key-unit) * ${(item.height ?? 1)})`}
+                                            ></div>
+                                        {:else}
                                             <button
-                                                class="keycode-option"
-                                                class:selected={modalKey.keycode === option.value}
-                                                onclick={() => modalKey.keycode = option.value}
+                                                type="button"
+                                                class="standard-key-button"
+                                                class:selected={modalKey.keycode === item.codeValue}
+                                                class:unavailable={!item.codeValue}
+                                                disabled={!item.codeValue}
+                                                style={`width: calc(var(--key-unit) * ${(item.width ?? 1)}); height: calc(var(--key-unit) * ${(item.height ?? 1)})`}
+                                                onclick={() => {
+                                                    if (!item.codeValue) {
+                                                        return;
+                                                    }
+                                                    modalKey.keycode = item.codeValue;
+                                                    modalKey = modalKey;
+                                                }}
                                             >
-                                                {option.label}
+                                                {#each item.legend as line}
+                                                    <span>{line}</span>
+                                                {/each}
                                             </button>
-                                        {/each}
-                                    </div>
+                                        {/if}
+                                    {/each}
                                 </div>
                             {/each}
+                        </div>
+                        <details class="other-key-options">
+                            <summary>Other keys</summary>
+                            <div class="keycode-selector">
+                                {#each Object.entries(getKeycodesByCategory()) as [category, options]}
+                                    {#if !standardKeyCategories.has(category)}
+                                        <div class="keycode-category">
+                                            <h4 class="category-title">{category}</h4>
+                                            <div class="keycode-grid">
+                                                {#each options as option}
+                                                    <button
+                                                        class="keycode-option"
+                                                        class:selected={modalKey.keycode === option.value}
+                                                        onclick={() => modalKey.keycode = option.value}
+                                                    >
+                                                        {option.label}
+                                                    </button>
+                                                {/each}
+                                            </div>
+                                        </div>
+                                    {/if}
+                                {/each}
+                            </div>
+                        </details>
+                    {:else if keyModalTab === 'layer'}
+                        <div class="midi-config">
+                            <div class="form-group">
+                                <label for="layerKeyAction">Layer Action</label>
+                                <select
+                                    id="layerKeyAction"
+                                    value={layerKeyType}
+                                    onchange={(event) => {
+                                        layerKeyType = event.target.value;
+                                        updateLayerKeySelection();
+                                    }}
+                                >
+                                    <option value="persistent">Persistent (TO)</option>
+                                    <option value="momentary">Momentary (MO)</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="layerKeyLayer">Layer</label>
+                                <select
+                                    id="layerKeyLayer"
+                                    value={layerKeyLayer}
+                                    onchange={(event) => {
+                                        layerKeyLayer = Number(event.target.value);
+                                        updateLayerKeySelection();
+                                    }}
+                                >
+                                    {#each layerKeySelectableIndices() as layerOption}
+                                        <option value={layerOption}>Layer {layerOption}</option>
+                                    {/each}
+                                </select>
+                            </div>
+                            <div class="midi-preview">
+                                <div class="preview-compact">
+                                    {#each formatKeyLabel(modalKey.keycode) as line}
+                                        <div class="preview-line">{line}</div>
+                                    {/each}
+                                </div>
+                                <div class="muted">Use the main Apply button to save changes.</div>
+                            </div>
                         </div>
                     {:else}
                         <div class="midi-config">
@@ -2836,9 +3329,9 @@
         backdrop-filter: blur(30px) saturate(180%);
         border: 1px solid rgba(0, 0, 0, 0.08);
         border-radius: 20px;
-        width: 100%;
-        max-width: 700px;
-        max-height: 80vh;
+        width: min(1120px, calc(100vw - 48px));
+        max-width: 1120px;
+        max-height: 90vh;
         display: flex;
         flex-direction: column;
         box-shadow: 
@@ -2970,6 +3463,114 @@
         gap: 20px;
     }
 
+    .standard-key-layout {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        padding: 18px 16px;
+        background: rgba(255, 255, 255, 0.03);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 16px;
+        width: fit-content;
+        margin: 0 auto;
+    }
+
+    .standard-key-row {
+        display: flex;
+        align-items: flex-start;
+        gap: 6px;
+    }
+
+    .standard-key-spacer {
+        height: calc(var(--key-unit));
+    }
+
+    .standard-key-button {
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+        gap: 2px;
+        padding: 10px 6px;
+        border-radius: 10px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        background: linear-gradient(180deg, rgba(40, 44, 56, 0.92), rgba(26, 29, 38, 0.94));
+        color: #f5f7ff;
+        font-size: 13px;
+        font-weight: 500;
+        cursor: pointer;
+        box-shadow: 0 8px 18px rgba(12, 19, 32, 0.35);
+        transition: transform 0.15s ease, box-shadow 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+    }
+
+    .standard-key-button span {
+        display: block;
+        line-height: 1.1;
+    }
+
+    .standard-key-button span:not(:last-child) {
+        font-size: 11px;
+        opacity: 0.72;
+    }
+
+    .standard-key-button span:last-child {
+        font-size: 13px;
+    }
+
+    .standard-key-button:hover:not(.unavailable) {
+        transform: translateY(-1px);
+        box-shadow: 0 12px 22px rgba(12, 19, 32, 0.45);
+        border-color: rgba(94, 189, 255, 0.4);
+    }
+
+    .standard-key-button.selected {
+        border-color: rgba(94, 189, 255, 0.7);
+        box-shadow: 0 0 0 3px rgba(94, 189, 255, 0.25);
+    }
+
+    .standard-key-button.unavailable {
+        cursor: not-allowed;
+        opacity: 0.4;
+        box-shadow: none;
+    }
+
+    .other-key-options {
+        margin-top: 24px;
+        background: rgba(15, 23, 42, 0.25);
+        border: 1px solid rgba(148, 163, 184, 0.18);
+        border-radius: 14px;
+        padding: 0 18px 12px;
+        color: #e1e4f5;
+    }
+
+    .other-key-options summary {
+        cursor: pointer;
+        font-size: 14px;
+        font-weight: 600;
+        list-style: none;
+        padding: 14px 0;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+
+    .other-key-options summary::-webkit-details-marker {
+        display: none;
+    }
+
+    .other-key-options summary::before {
+        content: '';
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        background: rgba(94, 189, 255, 0.8);
+        box-shadow: 0 0 12px rgba(94, 189, 255, 0.5);
+    }
+
+    .other-key-options[open] {
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+    }
+
     .form-group {
         display: flex;
         flex-direction: column;
@@ -2982,17 +3583,45 @@
         color: #a0a0a0;
     }
 
-    .form-group select,
+    .form-group select {
+        appearance: none;
+        -webkit-appearance: none;
+        padding: 12px 40px 12px 14px;
+        border-radius: 12px;
+        border: 1px solid rgba(15, 23, 42, 0.08);
+        background: linear-gradient(135deg, rgba(255, 255, 255, 0.92), rgba(240, 243, 248, 0.94));
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.65), 0 8px 20px rgba(15, 23, 42, 0.08);
+        color: #0f172a;
+        font-size: 14px;
+        font-weight: 500;
+        cursor: pointer;
+        transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.15s ease;
+        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='8' viewBox='0 0 14 8'%3E%3Cpath fill='%2357636f' d='M1 1l6 6 6-6'/%3E%3C/svg%3E");
+        background-repeat: no-repeat;
+        background-position: calc(100% - 14px) 50%;
+        background-size: 12px;
+    }
+
+    .form-group select:hover {
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7), 0 10px 24px rgba(15, 23, 42, 0.12);
+        transform: translateY(-1px);
+    }
+
+    .form-group select:focus {
+        outline: none;
+        border-color: rgba(59, 130, 246, 0.6);
+        box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2), inset 0 1px 0 rgba(255, 255, 255, 0.7);
+    }
+
     .form-group input {
         padding: 12px;
+        border-radius: 8px;
         background: rgba(255, 255, 255, 0.05);
         border: 1px solid rgba(255, 255, 255, 0.2);
-        border-radius: 8px;
         color: #ffffff;
         font-size: 14px;
     }
 
-    .form-group select:focus,
     .form-group input:focus {
         outline: none;
         border-color: #667eea;

@@ -334,21 +334,20 @@ pub struct I2CDeviceInfo {
     pub firmware_version_minor: u8,
     pub firmware_version_patch: u8,
     pub name: String,
-    pub reserved: [u8; 6],
 }
 
 impl I2CDeviceInfo {
     pub fn from_payload_at_index(payload: &[u8], index: usize) -> Result<Self, String> {
         // Each I2C device entry is 28 bytes (matches firmware i2c_device_info_t)
-        // Firmware structure: address(1) + device_type(1) + status(1) + fw_ver(3) + name(16) + reserved(6) = 28 bytes
+        // Firmware structure: address(1) + device_type(1) + status(1) + fw_ver(3) + name(22) = 28 bytes
         let offset = index * 28;
         if payload.len() < offset + 28 {
             return Err("I2C device info payload too short".to_string());
         }
 
-        // Extract device name (null-terminated string, 16 bytes in firmware)
-        let name_bytes = &payload[offset + 6..offset + 22]; // name starts at offset 6 (after address, device_type, status, and 3 fw_ver bytes)
-        let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(16);
+        // Extract device name (null-terminated string, 22 bytes in firmware)
+        let name_bytes = &payload[offset + 6..offset + 28]; // name starts at offset 6 (after address, device_type, status, and 3 fw_ver bytes)
+        let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(22);
         let name = String::from_utf8_lossy(&name_bytes[..name_end]).to_string();
 
         Ok(I2CDeviceInfo {
@@ -359,14 +358,6 @@ impl I2CDeviceInfo {
             firmware_version_minor: payload[offset + 4],
             firmware_version_patch: payload[offset + 5],
             name,
-            reserved: [
-                payload[offset + 22],
-                payload[offset + 23],
-                payload[offset + 24],
-                payload[offset + 25],
-                payload[offset + 26],
-                payload[offset + 27],
-            ],
         })
     }
     
@@ -376,12 +367,9 @@ impl I2CDeviceInfo {
         }
 
         // Extract device name (null-terminated string)
-        let name_bytes = &payload[6..22];
-        let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(16);
+        let name_bytes = &payload[6..28];
+        let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(22);
         let name = String::from_utf8_lossy(&name_bytes[..name_end]).to_string();
-
-        let mut reserved = [0u8; 6];
-        reserved.copy_from_slice(&payload[22..28]);
 
         Ok(I2CDeviceInfo {
             address: payload[0],
@@ -391,7 +379,6 @@ impl I2CDeviceInfo {
             firmware_version_minor: payload[4],
             firmware_version_patch: payload[5],
             name,
-            reserved,
         })
     }
 }
