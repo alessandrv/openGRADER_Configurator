@@ -17,6 +17,7 @@
     // I2C slave devices
     let i2cDevices = $state([]);
     let loadingI2CDevices = $state(false);
+    let i2cRefreshInFlight = false;
     let selectedDevice = $state('main'); // 'main' or slave address
     
     // Keymap and encoder data
@@ -117,6 +118,62 @@
             }
         }, 2000);
     }
+
+    async function refreshI2CDevices({ quiet = false } = {}) {
+        if (!isConnected) {
+            return;
+        }
+
+        if ((deviceInfo?.device_type ?? 0) !== 1) {
+            if (!quiet) {
+                console.log('Connected to slave device - no I2C slaves to query');
+            }
+            if (i2cDevices.length) {
+                i2cDevices = [];
+            }
+            if (selectedDevice !== 'main') {
+                selectedDevice = 'main';
+            }
+            return;
+        }
+
+        if (i2cRefreshInFlight) {
+            return;
+        }
+
+        i2cRefreshInFlight = true;
+
+        if (!quiet) {
+            loadingI2CDevices = true;
+        }
+
+        try {
+            const response = await invoke('get_i2c_devices');
+            const devices = Array.isArray(response) ? response : [];
+            const nextSnapshot = JSON.stringify(devices);
+            const currentSnapshot = JSON.stringify(i2cDevices);
+
+            if (nextSnapshot !== currentSnapshot) {
+                i2cDevices = devices;
+                if (selectedDevice !== 'main') {
+                    const stillPresent = devices.some((device) => String(device.address) === selectedDevice);
+                    if (!stillPresent) {
+                        selectedDevice = 'main';
+                    }
+                }
+                if (!quiet) {
+                    console.log('I2C devices updated:', devices);
+                }
+            }
+        } catch (e) {
+            console.error('Failed to load I2C devices:', e);
+        } finally {
+            if (!quiet) {
+                loadingI2CDevices = false;
+            }
+            i2cRefreshInFlight = false;
+        }
+    }
     
     function stopConnectionCheck() {
         if (connectionCheckInterval) {
@@ -177,22 +234,7 @@
             activeEncoderMenu = null;
 
             console.log('Auto-connected successfully:', result);
-            
-            // Only load I2C devices if this is a Master device (device_type = 1)
-            if (deviceInfo.device_type === 1) {
-                loadingI2CDevices = true;
-                try {
-                    i2cDevices = await invoke('get_i2c_devices');
-                    console.log('I2C devices loaded:', i2cDevices);
-                } catch (e) {
-                    console.error('Failed to load I2C devices:', e);
-                } finally {
-                    loadingI2CDevices = false;
-                }
-            } else {
-                console.log('Connected to slave device - no I2C slaves to query');
-                i2cDevices = [];
-            }
+            await refreshI2CDevices();
             
             slaveKeymaps = {};
             slaveEncoders = {};
@@ -215,6 +257,7 @@
             // Try a lightweight operation to check if device is still connected
             await invoke('get_board_layout');
             await refreshLayerStateFromDevice();
+            await refreshI2CDevices({ quiet: true });
         } catch (e) {
             console.log('Device disconnected, cleaning up...');
             handleDisconnection();
@@ -1848,7 +1891,7 @@
                                     class:active-hardware={hardwareActiveLayer === layerIndex}
                                     onclick={() => selectLayer(layerIndex)}
                                 >
-                                    <span class="layer-label">L:{layerIndex}</span>
+                                    <span class="layer-label">{layerIndex}</span>
                                     {#if isDefaultLayer(layerIndex)}
                                         <span class="layer-pill">D</span>
                                     {/if}
