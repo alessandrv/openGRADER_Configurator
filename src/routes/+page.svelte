@@ -1925,11 +1925,7 @@
                                     Set as Default
                                 </button>
                                
-                                {#if momentaryLayer !== null}
-                                    <div class="momentary-indicator">
-                                        Momentary layer {momentaryLayer}
-                                    </div>
-                                {/if}
+                               
                             </div>
                         {/if}
                     </div>

@@ -337,49 +337,28 @@ pub struct I2CDeviceInfo {
 }
 
 impl I2CDeviceInfo {
-    pub fn from_payload_at_index(payload: &[u8], index: usize) -> Result<Self, String> {
-        // Each I2C device entry is 28 bytes (matches firmware i2c_device_info_t)
-        // Firmware structure: address(1) + device_type(1) + status(1) + fw_ver(3) + name(22) = 28 bytes
-        let offset = index * 28;
-        if payload.len() < offset + 28 {
-            return Err("I2C device info payload too short".to_string());
+    pub fn from_device_info(address: u8, status: u8, info: &DeviceInfo) -> Self {
+        I2CDeviceInfo {
+            address,
+            device_type: info.device_type,
+            status,
+            firmware_version_major: info.firmware_version_major,
+            firmware_version_minor: info.firmware_version_minor,
+            firmware_version_patch: info.firmware_version_patch,
+            name: info.device_name.clone(),
         }
-
-        // Extract device name (null-terminated string, 22 bytes in firmware)
-        let name_bytes = &payload[offset + 6..offset + 28]; // name starts at offset 6 (after address, device_type, status, and 3 fw_ver bytes)
-        let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(22);
-        let name = String::from_utf8_lossy(&name_bytes[..name_end]).to_string();
-
-        Ok(I2CDeviceInfo {
-            address: payload[offset],
-            device_type: payload[offset + 1],
-            status: payload[offset + 2], // status is at offset 2 (after address and device_type)
-            firmware_version_major: payload[offset + 3],
-            firmware_version_minor: payload[offset + 4],
-            firmware_version_patch: payload[offset + 5],
-            name,
-        })
     }
-    
-    pub fn from_payload(payload: &[u8]) -> Result<Self, String> {
-        if payload.len() < 28 {
-            return Err("I2C device info payload too short".to_string());
+
+    pub fn with_fallback(address: u8, status: u8) -> Self {
+        I2CDeviceInfo {
+            address,
+            device_type: 0,
+            status,
+            firmware_version_major: 0,
+            firmware_version_minor: 0,
+            firmware_version_patch: 0,
+            name: format!("Slave {:02X}", address),
         }
-
-        // Extract device name (null-terminated string)
-        let name_bytes = &payload[6..28];
-        let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(22);
-        let name = String::from_utf8_lossy(&name_bytes[..name_end]).to_string();
-
-        Ok(I2CDeviceInfo {
-            address: payload[0],
-            device_type: payload[1],
-            status: payload[2],
-            firmware_version_major: payload[3],
-            firmware_version_minor: payload[4],
-            firmware_version_patch: payload[5],
-            name,
-        })
     }
 }
 

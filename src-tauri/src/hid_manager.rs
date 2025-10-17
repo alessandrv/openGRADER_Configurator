@@ -857,31 +857,48 @@ impl HidManager {
         println!("DEBUG: Device count from firmware: {}", device_count);
         
         let mut i2c_devices = Vec::new();
-        
-        // Each device entry is 28 bytes, starting at offset 1
-        // Firmware format: payload[0] = count, then device entries at payload[1..]
-        let device_data_start = 1;
-        
+        let entry_size = 2usize; // address + status
+
         for i in 0..device_count {
-            let device_offset = device_data_start + (i * 28);
-            if device_offset + 28 <= response.payload_length as usize {
-                // Extract device info starting from the correct offset
-                let device_slice = &response.payload[device_offset..];
-                match I2CDeviceInfo::from_payload_at_index(device_slice, 0) {
-                    Ok(device_info) => {
-                        println!("DEBUG: Parsed device {}: addr=0x{:02X}, name={}", i, device_info.address, device_info.name);
-                        i2c_devices.push(device_info);
-                    },
-                    Err(e) => {
-                        println!("WARN: Failed to parse device {}: {}", i, e);
-                    }
-                }
-            } else {
+            let base = 1 + (i * entry_size);
+            if base + entry_size > response.payload_length as usize {
                 println!("WARN: Payload too short for device {}", i);
                 break;
             }
+
+            let address = response.payload[base];
+            let status = response.payload[base + 1];
+
+            println!(
+                "DEBUG: Discovered slave {} at 0x{:02X} (status={})",
+                i, address, status
+            );
+
+            if status == 0 {
+                // Offline device entry
+                i2c_devices.push(I2CDeviceInfo::with_fallback(address, status));
+                continue;
+            }
+
+            match self.get_slave_info(address).await {
+                Ok(device_info) => {
+                    let info = I2CDeviceInfo::from_device_info(address, status, &device_info);
+                    println!(
+                        "DEBUG: Fetched info for slave {}: addr=0x{:02X}, name={}",
+                        i, info.address, info.name
+                    );
+                    i2c_devices.push(info);
+                }
+                Err(e) => {
+                    println!(
+                        "WARN: Failed to fetch detailed info for device {} at 0x{:02X}: {}",
+                        i, address, e
+                    );
+                    i2c_devices.push(I2CDeviceInfo::with_fallback(address, status));
+                }
+            }
         }
-        
+
         Ok(i2c_devices)
     }
 
