@@ -13,6 +13,7 @@
     let dataLoaded = false;
     let loadingKeymap = $state(false);
     let loadingEncoders = $state(false);
+    let loadingLayout = $state(false);
     
     // I2C slave devices
     let i2cDevices = $state([]);
@@ -36,6 +37,12 @@
     let manualLayerOverride = false;
     let boardLayout = $state(null);
     let activeEncoderMenu = $state(null);
+    let activeSliderMenu = $state(null); // For slider configuration menu
+    
+    // Slider state
+    let sliderValues = $state({}); // Map of slider ID -> current value (0-127)
+    let sliderConfigs = $state({}); // Map of slider ID -> configuration
+    
     let keycodes = {};
     let keycodeByName = {};
     
@@ -65,6 +72,7 @@
     let autoConnectInterval = null;
     let connectionCheckInterval = null;
     let layerStatePollInterval = null;
+    let sliderPollInterval = null; // For real-time slider value updates
 
     onMount(() => {
         console.log('=== FRONTEND: App started ===');
@@ -199,6 +207,23 @@
         }
     }
     
+    function startSliderPolling() {
+        if (sliderPollInterval) return;
+
+        sliderPollInterval = setInterval(() => {
+            if (isConnected) {
+                pollSliderValues();
+            }
+        }, 50); // Poll every 50ms for very responsive slider feedback
+    }
+
+    function stopSliderPolling() {
+        if (sliderPollInterval) {
+            clearInterval(sliderPollInterval);
+            sliderPollInterval = null;
+        }
+    }
+    
     async function tryAutoConnect() {
         try {
             console.log('Attempting auto-connect...');
@@ -222,15 +247,35 @@
 
             await refreshLayerStateFromDevice();
             boardLayout = result.layout ?? null;
+            // Normalize layout field names for the frontend: some code expects
+            // matrix_rows/matrix_cols while other parts use rows/cols. Provide
+            // fallback aliases to keep both styles working.
+            if (boardLayout) {
+                boardLayout.rows = boardLayout.rows ?? boardLayout.matrix_rows;
+                boardLayout.cols = boardLayout.cols ?? boardLayout.matrix_cols;
+            }
             dataLoaded = true;
 
             if (!boardLayout) {
                 try {
                     boardLayout = await invoke('get_board_layout');
+                    if (boardLayout) {
+                        boardLayout.rows = boardLayout.rows ?? boardLayout.matrix_rows;
+                        boardLayout.cols = boardLayout.cols ?? boardLayout.matrix_cols;
+                    }
                 } catch (layoutError) {
                     console.warn('Failed to fetch board layout metadata:', layoutError);
                 }
             }
+            
+            // Initialize default slider data
+            initializeSliderData();
+            
+            // Load real slider config from device and get initial values for all sliders
+            await loadAllSliderConfigs();
+            await pollSliderValues(); // Get initial values immediately
+            startSliderPolling();
+            
             activeEncoderMenu = null;
 
             console.log('Auto-connected successfully:', result);
@@ -277,6 +322,8 @@
     layerStateBusy = false;
     updateLayerStateLocal(null);
         boardLayout = null;
+        layoutMatrix = [];
+        layoutMatrixReady = false;
         selectedKey = null;
         selectedEncoder = null;
         activeEncoderMenu = null;
@@ -290,8 +337,12 @@
         showSavePopup = false;
         i2cDevices = [];
         
+        // Clear layout cache when disconnecting
+        clearLayoutCache();
+        
         stopConnectionCheck();
         stopLayerStatePolling();
+        stopSliderPolling();
         
         console.log('Device disconnected, will attempt to reconnect...');
     }
@@ -747,7 +798,8 @@
                 }; // trigger reactivity
             }
             
-            checkForChanges();
+            // Update original data since changes are now saved to EEPROM
+            storeOriginalData();
         } catch (e) {
             error = `Failed to update keymap: ${e}`;
             console.error('Failed to update keymap:', e);
@@ -1027,63 +1079,513 @@
         }
     }
 
-    function isEncoderCell(row, col) {
-        const layout = getCurrentLayout();
-        if (!layout) return false;
-        const cols = layout.matrix_cols ?? 0;
-        if (col >= cols) return false;
-        const index = row * cols + col;
-        const byteIndex = Math.floor(index / 8);
-        const bitIndex = index % 8;
-        const bitmap = layout.encoder_bitmap || [];
-        const byte = bitmap[byteIndex] ?? 0;
-        return (byte & (1 << bitIndex)) !== 0;
+    // Layout cell type cache for performance
+    let layoutCellCache = new Map();
+    let layoutMatrix = $state([]); // 2D array to store layout cell types for template use
+    let layoutMatrixReady = $state(false); // Flag to indicate when layout matrix is fully populated
+    
+    // Initialize layout matrix when board layout info is available
+    async function initializeLayoutMatrix() {
+        if (!isConnected || !boardLayout || loadingLayout || layoutMatrixReady) return;
+        
+        console.log('Starting layout matrix initialization...');
+        loadingLayout = true;
+        layoutMatrixReady = false;
+        
+        const rows = boardLayout.matrix_rows || 0;
+        const cols = boardLayout.matrix_cols || 0;
+        
+        console.log(`Initializing layout matrix: ${rows}x${cols}`);
+        
+        try {
+            const matrix = [];
+            for (let row = 0; row < rows; row++) {
+                const rowCells = [];
+                for (let col = 0; col < cols; col++) {
+                    try {
+                        const cellType = await getCachedLayoutCellType(row, col);
+                        const componentId = await invoke('get_layout_cell_component_id', { row, col });
+                        
+                        rowCells.push({
+                            type: cellType,
+                            componentId: componentId,
+                            isSwitch: cellType === 1,
+                            isEncoder: cellType === 2,
+                            isSlider: cellType === 3,
+                            isPotentiometer: cellType === 4,
+                            isEmpty: cellType === 0
+                        });
+                        
+                        // Log layout for debugging
+                        let typeStr = 'EMPTY';
+                        if (cellType === 1) typeStr = 'SW';
+                        else if (cellType === 2) typeStr = 'ENC';
+                        else if (cellType === 3) typeStr = 'SLIDER';
+                        else if (cellType === 4) typeStr = 'POT';
+                        console.log(`Layout (${row},${col}): ${typeStr} ID=${componentId}`);
+                    } catch (e) {
+                        console.error(`Failed to get layout for (${row},${col}):`, e);
+                        rowCells.push({
+                            type: 0,
+                            componentId: 0,
+                            isSwitch: false,
+                            isEncoder: false,
+                            isSlider: false,
+                            isPotentiometer: false,
+                            isEmpty: true
+                        });
+                    }
+                }
+                matrix.push(rowCells);
+            }
+            
+            layoutMatrix = matrix;
+            layoutMatrixReady = true;
+            console.log('Layout matrix initialized:', matrix);
+        } catch (e) {
+            console.error('Failed to initialize layout matrix:', e);
+        } finally {
+            loadingLayout = false;
+        }
+    }
+    
+    // Synchronous helper functions for template use
+    function getLayoutCell(row, col) {
+        if (!layoutMatrix || row >= layoutMatrix.length || col >= (layoutMatrix[row]?.length || 0)) {
+            return { type: 0, componentId: 0, isSwitch: false, isEncoder: false, isSlider: false, isPotentiometer: false, isEmpty: true };
+        }
+        return layoutMatrix[row][col];
+    }
+    
+    function isEncoderCellSync(row, col) {
+        if (!layoutMatrixReady) return false; // Don't show encoders until layout is fully loaded
+        return getLayoutCell(row, col).isEncoder;
+    }
+    
+    function isSwitchCellSync(row, col) {
+        if (!layoutMatrixReady) return true; // Show all cells as switches until layout is loaded
+        return getLayoutCell(row, col).isSwitch;
+    }
+    
+    function isSliderCellSync(row, col) {
+        return getLayoutCell(row, col).isSlider;
+    }
+    
+    function getComponentId(row, col) {
+        return getLayoutCell(row, col).componentId;
+    }
+    
+    // Watch for board layout changes and initialize layout matrix
+    $effect(() => {
+        console.log('Effect triggered:', { 
+            boardLayout: !!boardLayout, 
+            isConnected, 
+            loadingLayout, 
+            layoutMatrixReady 
+        });
+        if (boardLayout && isConnected && !loadingLayout && !layoutMatrixReady) {
+            console.log('Board layout changed, initializing layout matrix...');
+            initializeLayoutMatrix();
+        }
+    });
+
+    // Watch for layer changes and reload slider configurations
+    $effect(() => {
+        if (isConnected && selectedLayer !== undefined && sliderConfigs) {
+            console.log(`Layer changed to ${selectedLayer}, reloading slider configurations...`);
+            // Reload slider configs for the new layer
+            loadAllSliderConfigs(); // Reload for all sliders
+        }
+    });
+    
+    // Test the new layout API when device connects
+    async function testLayoutAPI() {
+        if (!isConnected) return;
+        
+        console.log('=== Testing Layout API ===');
+        
+        try {
+            const layout = await invoke('get_board_layout');
+            console.log('Board layout:', layout);
+            
+            // Test a few cells
+            for (let row = 0; row < Math.min(3, layout.matrix_rows || 0); row++) {
+                for (let col = 0; col < Math.min(5, layout.matrix_cols || 0); col++) {
+                    const cellType = await getCachedLayoutCellType(row, col);
+                    const componentId = await invoke('get_layout_cell_component_id', { row, col });
+                    
+                    let typeStr = 'EMPTY';
+                    if (cellType === 1) typeStr = 'SW';
+                    else if (cellType === 2) typeStr = 'ENC';
+                    else if (cellType === 3) typeStr = 'SLIDER';
+                    
+                    console.log(`Cell (${row},${col}): ${typeStr} ID=${componentId}`);
+                }
+            }
+        } catch (e) {
+            console.error('Layout API test failed:', e);
+        }
+        
+        console.log('=== Layout API Test Complete ===');
+    }
+    async function getCachedLayoutCellType(row, col) {
+        const key = `${row},${col}`;
+        if (layoutCellCache.has(key)) {
+            return layoutCellCache.get(key);
+        }
+        
+        try {
+            const cellType = await invoke('get_layout_cell_type', { row, col });
+            layoutCellCache.set(key, cellType);
+            return cellType;
+        } catch (e) {
+            console.error('Failed to get layout cell type:', e);
+            return 0; // LAYOUT_EMPTY
+        }
+    }
+    
+    // Clear layout cache when device changes
+    function clearLayoutCache() {
+        layoutCellCache.clear();
+        layoutMatrix = [];
+    }
+    
+    // Async versions for programmatic use
+    async function isEncoderCellAsync(row, col) {
+        if (!isConnected) return false;
+        const cellType = await getCachedLayoutCellType(row, col);
+        return cellType === 2; // LAYOUT_ENCODER
+    }
+    
+    async function isSwitchCellAsync(row, col) {
+        if (!isConnected) return false;
+        const cellType = await getCachedLayoutCellType(row, col);
+        return cellType === 1; // LAYOUT_SWITCH
+    }
+    
+    async function isSliderCellAsync(row, col) {
+        if (!isConnected) return false;
+        const cellType = await getCachedLayoutCellType(row, col);
+        return cellType === 3; // LAYOUT_SLIDER
     }
 
+    async function encoderIdForCellAsync(row, col) {
+        if (!await isEncoderCellAsync(row, col)) return null;
+        
+        // Use the synchronous version for better performance once matrix is loaded
+        if (layoutMatrix && layoutMatrix[row] && layoutMatrix[row][col]) {
+            return layoutMatrix[row][col].isEncoder ? layoutMatrix[row][col].componentId : null;
+        }
+        
+        try {
+            const componentId = await invoke('get_layout_cell_component_id', { row, col });
+            return componentId;
+        } catch (e) {
+            console.error('Failed to get encoder component ID:', e);
+            return null;
+        }
+    }
+    
+    // Synchronous version for template use
+    function encoderIdForCellSync(row, col) {
+        if (!isEncoderCellSync(row, col)) return null;
+        return getComponentId(row, col);
+    }
+    
+    // Template-compatible synchronous functions that use the layout matrix
+    function isEncoderCell(row, col) {
+        return isEncoderCellSync(row, col);
+    }
+    
+    function isSliderCell(row, col) {
+        return isSliderCellSync(row, col);
+    }
+    
+    function isPotentiometerCell(row, col) {
+        return getLayoutCell(row, col).isPotentiometer;
+    }
+    
+    function isEmptyCell(row, col) {
+        return getLayoutCell(row, col).isEmpty;
+    }
+    
     function encoderIdForCell(row, col) {
-        const layout = getCurrentLayout();
-        if (!layout) return null;
-        if (!isEncoderCell(row, col)) return null;
-
-        const firstEncoderColumn = layout.first_encoder_column ?? 0;
-        if (col < firstEncoderColumn) return null;
-
-        const perRow = layout.encoders_per_row ?? 0;
-        if (!perRow) return null;
-
-        const offsetCol = col - firstEncoderColumn;
-        const id = row * perRow + offsetCol;
-        return id < (layout.encoder_count ?? 0) ? id : null;
+        return encoderIdForCellSync(row, col);
     }
 
     function getEncoderEntryById(encoderId) {
         return getCurrentEncoders().find((encoder) => encoder.encoder_id === encoderId) || null;
     }
 
+    // Slider functions
+    function sliderIdForCell(row, col) {
+        return getComponentId(row, col);
+    }
+    
+    function getSliderValue(sliderId) {
+        // Return actual value if available, otherwise 0 (which means no data yet)
+        return sliderValues[sliderId] !== undefined ? sliderValues[sliderId] : 0;
+    }
+    
+    function getSliderConfig(sliderId) {
+        return sliderConfigs[sliderId] || {
+            midi_channel: 0,
+            midi_cc: sliderId + 1, // Use sliderId+1 as default CC so pot 0 = CC1, pot 1 = CC2
+            min_midi_value: 0,
+            max_midi_value: 127
+        };
+    }
+    
+    function getSliderPosition(sliderId) {
+        const value = getSliderValue(sliderId);
+        const config = getSliderConfig(sliderId);
+        const percentage = ((value - config.min_midi_value) / (config.max_midi_value - config.min_midi_value)) * 100;
+        
+        // Account for thumb height (12px) relative to track height (240px)
+        // This prevents the thumb from extending beyond the track boundaries
+        const thumbHeightPercent = (12 / 240) * 100; // ~5%
+        const maxPosition = 100 - thumbHeightPercent;
+        
+        return Math.max(0, Math.min(maxPosition, percentage));
+    }
+    
+    function getPotentiometerAngle(sliderId) {
+        const value = getSliderValue(sliderId);  // Use slider value function
+        const config = getSliderConfig(sliderId);  // Use slider config function
+        const percentage = ((value - config.min_midi_value) / (config.max_midi_value - config.min_midi_value));
+        
+        // Convert to angle: 0% = -135°, 100% = +135° (270° total range)
+        const minAngle = -135;
+        const maxAngle = 135;
+        const angle = minAngle + (percentage * (maxAngle - minAngle));
+        
+        return Math.max(minAngle, Math.min(maxAngle, angle));
+    }
+    
+    function initializeSliderData() {
+        // Initialize slider configurations and values based on board layout
+        const sliderIds = [];
+        
+        // Get all slider IDs from the board layout
+        if (boardLayout && boardLayout.layout) {
+            for (let row = 0; row < (boardLayout.rows || boardLayout.matrix_rows); row++) {
+                for (let col = 0; col < (boardLayout.cols || boardLayout.matrix_cols); col++) {
+                    const cellIndex = row * (boardLayout.cols || boardLayout.matrix_cols) + col;
+                    const cell = boardLayout.layout[cellIndex];
+                    if (!cell) continue;
+
+                    // Support different serializers/shapes coming from backend:
+                    // - cell.type (string like 'SLIDER' or 'Slider')
+                    // - cell.cell_type (string or numeric)
+                    // - cell.component_id vs componentId
+                    const rawType = cell.type ?? cell.cell_type ?? cell.cellType ?? null;
+                    let isSlider = false;
+                    if (rawType !== null && rawType !== undefined) {
+                        if (typeof rawType === 'number') {
+                            isSlider = rawType === 3 || rawType === 4; // Include both sliders (3) and potentiometers (4)
+                        } else if (typeof rawType === 'string') {
+                            isSlider = rawType.toLowerCase() === 'slider' || rawType.toLowerCase() === 'sliders' || rawType.toLowerCase() === 'slider' || rawType.toLowerCase() === 'potentiometer';
+                        }
+                    }
+
+                    const compId = cell.component_id ?? cell.componentId ?? cell.componentid ?? cell.component ?? 0;
+                    if (isSlider) {
+                        sliderIds.push(compId);
+                    }
+                }
+            }
+        }
+        
+        // If no sliders found in layout, fallback to slider 0 for backward compatibility
+        if (sliderIds.length === 0) {
+            sliderIds.push(0);
+        }
+        
+        // Initialize configurations and values for all found sliders
+        sliderConfigs = {};
+        sliderValues = {};
+        
+        sliderIds.forEach((sliderId, index) => {
+            sliderConfigs[sliderId] = {
+                midi_channel: 0,
+                midi_cc: index + 1, // Default to CC 1, 2, 3, etc.
+                min_midi_value: 0,
+                max_midi_value: 127
+            };
+            sliderValues[sliderId] = 64; // Start at middle position
+        });
+        
+        console.log('Initialized slider data:', { sliderConfigs, sliderValues, foundSliders: sliderIds });
+    }
+    
+    // Real-time slider value polling
+    async function pollSliderValues() {
+        if (!isConnected) return;
+        
+        try {
+            // For potentiometer keyboard, directly poll sliders 0 and 1
+            // since we know they exist from the layout initialization
+            const sliderIds = [0, 1];
+            console.log(`DEBUG: Directly polling slider IDs: [${sliderIds.join(', ')}]`);
+            
+            // Poll each slider's current raw value
+            for (const sliderId of sliderIds) {
+                try {
+                    const value = await invoke('get_slider_value', { sliderId });
+                    console.log(`DEBUG: Got slider ${sliderId} value = ${value}`);
+                    sliderValues[sliderId] = value;
+                } catch (e) {
+                    console.warn(`Failed to poll slider ${sliderId} value:`, e);
+                }
+            }
+            
+            // Force reactivity update
+            sliderValues = { ...sliderValues };
+        } catch (e) {
+            console.warn('Failed to poll slider values:', e);
+        }
+    }
+    
+    // Load slider configuration from device
+    async function loadSliderConfig(sliderId) {
+        try {
+            console.log(`Loading slider ${sliderId} config for layer ${selectedLayer}...`);
+            const config = await invoke('get_slider_config', { layer: selectedLayer, sliderId });
+            sliderConfigs[sliderId] = config;
+            console.log(`Loaded slider ${sliderId} config for layer ${selectedLayer}:`, config);
+        } catch (e) {
+            console.warn(`Failed to load slider ${sliderId} config:`, e);
+            // Keep default config on error
+        }
+    }
+
+    // Load configurations for all sliders found in the layout
+    async function loadAllSliderConfigs() {
+        if (!boardLayout) return;
+        
+        // Get all slider and potentiometer IDs from the board layout (potentiometers reuse slider backend)
+        const sliderIds = [];
+        if (boardLayout.layout) {
+            for (let row = 0; row < (boardLayout.rows || boardLayout.matrix_rows); row++) {
+                for (let col = 0; col < (boardLayout.cols || boardLayout.matrix_cols); col++) {
+                    const cellIndex = row * (boardLayout.cols || boardLayout.matrix_cols) + col;
+                    const cell = boardLayout.layout[cellIndex];
+                    if (!cell) continue;
+
+                    const rawType = cell.type ?? cell.cell_type ?? cell.cellType ?? null;
+                    let isSlider = false;
+                    if (rawType !== null && rawType !== undefined) {
+                        if (typeof rawType === 'number') {
+                            isSlider = rawType === 3 || rawType === 4; // Include both sliders (3) and potentiometers (4)
+                        } else if (typeof rawType === 'string') {
+                            isSlider = rawType.toLowerCase() === 'slider' || rawType.toLowerCase() === 'potentiometer';
+                        }
+                    }
+
+                    const compId = cell.component_id ?? cell.componentId ?? cell.component ?? 0;
+                    if (isSlider) {
+                        sliderIds.push(compId);
+                    }
+                }
+            }
+        }
+        
+        // If no sliders/potentiometers found in layout, fallback to slider 0
+        if (sliderIds.length === 0) {
+            sliderIds.push(0);
+        }
+        
+        // Load configuration for each slider/potentiometer
+        for (const sliderId of sliderIds) {
+            await loadSliderConfig(sliderId);
+        }
+        
+        console.log('Loaded all slider configs:', sliderConfigs);
+    }
+
     function closeEncoderMenu() {
         activeEncoderMenu = null;
+    }
+    
+    function closeSliderMenu() {
+        activeSliderMenu = null;
+    }
+    
+    function toggleSliderMenu(row, col, event) {
+        event.stopPropagation();
+        if (loadingEncoders || loadingKeymap || loadingLayout) {
+            return;
+        }
+        
+        const sliderId = sliderIdForCell(row, col);
+        if (sliderId === null || sliderId === undefined) return;
+
+        if (activeSliderMenu && activeSliderMenu.row === row && activeSliderMenu.col === col) {
+            activeSliderMenu = null;
+        } else {
+            activeSliderMenu = { row, col, sliderId };
+        }
+        
+        // Close encoder menu if open
+        activeEncoderMenu = null;
+    }
+    
+    function updateSliderValue(sliderId, newValue) {
+        sliderValues[sliderId] = Math.max(0, Math.min(127, newValue));
+        console.log(`Slider ${sliderId} value updated to:`, sliderValues[sliderId]);
+    }
+    
+    async function updateSliderConfig(sliderId, config) {
+        // Update local state
+        sliderConfigs[sliderId] = { ...sliderConfigs[sliderId], ...config };
+        console.log(`Slider ${sliderId} config updated:`, sliderConfigs[sliderId]);
+        
+        // Apply changes immediately to device and save to EEPROM
+        try {
+            const deviceConfig = {
+                ...sliderConfigs[sliderId],
+                layer: selectedLayer,
+                slider_id: sliderId
+            };
+            await invoke('set_slider_config', { config: deviceConfig });
+            console.log(`Saved slider ${sliderId} config to device EEPROM immediately`);
+            
+            // Update original data since we just saved to EEPROM
+            storeOriginalData();
+        } catch (e) {
+            console.error(`Failed to save slider ${sliderId} config to device:`, e);
+        }
     }
 
     /** @param {PointerEvent} event */
     function handleGlobalPointerDown(event) {
-        if (!activeEncoderMenu) return;
+        if (!activeEncoderMenu && !activeSliderMenu) return;
         const target = event.target;
         if (!(target instanceof Element)) {
             return;
         }
 
-        if (target.closest('.encoder-menu') || target.closest('.encoder-key')) {
+        // Check if click is inside encoder menu or encoder key
+        if (activeEncoderMenu && (target.closest('.encoder-menu') || target.closest('.encoder-key'))) {
+            return;
+        }
+        
+        // Check if click is inside slider menu or slider container
+        if (activeSliderMenu && (target.closest('.slider-menu') || target.closest('.slider-container'))) {
             return;
         }
 
-        closeEncoderMenu();
+        // Close menus if clicked outside
+        if (activeEncoderMenu) closeEncoderMenu();
+        if (activeSliderMenu) closeSliderMenu();
     }
 
     /** @param {KeyboardEvent} event */
     function handleGlobalKeydown(event) {
-        if (!activeEncoderMenu) return;
+        if (!activeEncoderMenu && !activeSliderMenu) return;
         if (event.key === 'Escape') {
-            closeEncoderMenu();
+            if (activeEncoderMenu) closeEncoderMenu();
+            if (activeSliderMenu) closeSliderMenu();
         }
     }
 
@@ -1091,7 +1593,7 @@
         if (event) {
             event.stopPropagation();
         }
-        if (loadingEncoders || loadingKeymap) {
+        if (loadingEncoders || loadingKeymap || loadingLayout) {
             return;
         }
         const encoderId = encoderIdForCell(row, col);
@@ -1218,7 +1720,9 @@
                     [slaveAddr]: slaveLayers
                 };
             }
-            checkForChanges();
+            
+            // Update original data since changes are now saved to EEPROM
+            storeOriginalData();
         } catch (e) {
             error = `Failed to update encoder: ${e}`;
         }
@@ -1930,25 +2434,219 @@
                         {/if}
                     </div>
                     
-                    {#if loadingKeymap}
+                    {#if loadingKeymap || loadingLayout || (getCurrentKeymap().length > 0 && !layoutMatrixReady)}
                         <div class="loading-state">
                             <div class="spinner-large"></div>
-                            <h3>Loading Keymap...</h3>000
-                            <p>{selectedDevice === 'main' ? 'Fetching key configuration from device' : `Loading keymap from slave device 0x${parseInt(selectedDevice, 10).toString(16).toUpperCase()}`}</p>
+                            <h3>{loadingLayout || !layoutMatrixReady ? 'Loading Layout...' : 'Loading Keymap...'}</h3>
+                            <p>{loadingLayout || !layoutMatrixReady ? 'Detecting switch and encoder positions' : (selectedDevice === 'main' ? 'Fetching key configuration from device' : `Loading keymap from slave device 0x${parseInt(selectedDevice, 10).toString(16).toUpperCase()}`)}</p>
                         </div>
-                    {:else if getCurrentKeymap().length > 0}
+                    {:else if getCurrentKeymap().length > 0 && layoutMatrixReady}
                         <!-- keys open modal -->
                         <div class="keymap-container">
                             <div
                                 class="keymap"
-                                class:loading={loadingKeymap || loadingEncoders}
-                                aria-busy={loadingKeymap || loadingEncoders}
+                                class:loading={loadingKeymap || loadingEncoders || loadingLayout}
+                                aria-busy={loadingKeymap || loadingEncoders || loadingLayout}
+                                style="--board-cols: {boardLayout?.cols || boardLayout?.matrix_cols || 3};"
                             >
                                 {#each getCurrentKeymap() as row, rowIndex}
                                     <div class="keymap-row">
                                         {#each row as key, colIndex}
-                                            <div class={`keymap-cell ${isEncoderCell(rowIndex, colIndex) ? 'encoder-cell' : ''} ${activeEncoderMenu && activeEncoderMenu.row === rowIndex && activeEncoderMenu.col === colIndex ? 'active-encoder' : ''}`}>
-                                                {#if isEncoderCell(rowIndex, colIndex)}
+                                            {#if !isEmptyCell(rowIndex, colIndex)}
+                                                <div class={`keymap-cell ${isEncoderCell(rowIndex, colIndex) ? 'encoder-cell' : ''} ${isSliderCell(rowIndex, colIndex) ? 'slider-cell' : ''} ${isPotentiometerCell(rowIndex, colIndex) ? 'potentiometer-cell' : ''} ${activeEncoderMenu && activeEncoderMenu.row === rowIndex && activeEncoderMenu.col === colIndex ? 'active-encoder' : ''}`}>
+                                                {#if isSliderCell(rowIndex, colIndex)}
+                                                    <!-- Slider component -->
+                                                    {@const sliderId = sliderIdForCell(rowIndex, colIndex)}
+                                                    {@const sliderValue = getSliderValue(sliderId)}
+                                                    {@const sliderConfig = getSliderConfig(sliderId)}
+                                                    {@const sliderPosition = getSliderPosition(sliderId)}
+                                                    <button
+                                                        class="slider-container"
+                                                        onclick={(event) => toggleSliderMenu(rowIndex, colIndex, event)}
+                                                        aria-label={`Slider ${sliderId} at R${rowIndex}C${colIndex}, value ${sliderValue}`}
+                                                    >
+                                                        <div class="slider-track">
+                                                            <div class="slider-thumb" style="bottom: {sliderPosition}%"></div>
+                                                        </div>
+                                                        <div class="slider-info">
+                                                            <div class="slider-value">{sliderValue}</div>
+                                                            <div class="slider-range">{sliderConfig.min_midi_value}-{sliderConfig.max_midi_value}</div>
+                                                            <div class="slider-cc">CC{sliderConfig.midi_cc}</div>
+                                                            <div class="slider-channel">CH{sliderConfig.midi_channel + 1}</div>
+                                                        </div>
+                                                    </button>
+                                                    
+                                                    <!-- Slider Configuration Menu -->
+                                                    {#if activeSliderMenu && activeSliderMenu.row === rowIndex && activeSliderMenu.col === colIndex}
+                                                        <div class="slider-menu active">
+                                                            <div class="slider-config-panel">
+                                                                <h3>Slider Configuration</h3>
+                                                                <div class="slider-config-section">
+                                                                    <label for="midi-channel-{sliderId}">MIDI Channel</label>
+                                                                    <input 
+                                                                        id="midi-channel-{sliderId}"
+                                                                        type="number" 
+                                                                        min="1" 
+                                                                        max="16" 
+                                                                        value={sliderConfig.midi_channel + 1}
+                                                                        onchange={(e) => {
+                                                                            let ch = parseInt(e.target.value) - 1;
+                                                                            ch = Math.max(0, Math.min(15, ch));
+                                                                            updateSliderConfig(sliderId, { midi_channel: ch });
+                                                                        }}
+                                                                    />
+                                                                </div>
+                                                                <div class="slider-config-section">
+                                                                    <label for="midi-cc-{sliderId}">CC Number</label>
+                                                                    <input 
+                                                                        id="midi-cc-{sliderId}"
+                                                                        type="number" 
+                                                                        min="0" 
+                                                                        max="127" 
+                                                                        bind:value={sliderConfig.midi_cc}
+                                                                        onchange={(e) => {
+                                                                            let cc = parseInt(e.target.value);
+                                                                            cc = Math.max(0, Math.min(127, cc));
+                                                                            updateSliderConfig(sliderId, { midi_cc: cc });
+                                                                        }}
+                                                                    />
+                                                                </div>
+                                                                <div class="slider-config-section">
+                                                                    <label for="min-value-{sliderId}">Min Value</label>
+                                                                    <input 
+                                                                        id="min-value-{sliderId}"
+                                                                        type="number" 
+                                                                        min="0" 
+                                                                        max="127" 
+                                                                        bind:value={sliderConfig.min_midi_value}
+                                                                        onchange={(e) => {
+                                                                            let min = parseInt(e.target.value);
+                                                                            min = Math.max(0, Math.min(127, min));
+                                                                            // Ensure min <= max
+                                                                            if (min > sliderConfig.max_midi_value) {
+                                                                                min = sliderConfig.max_midi_value;
+                                                                            }
+                                                                            updateSliderConfig(sliderId, { min_midi_value: min });
+                                                                        }}
+                                                                    />
+                                                                </div>
+                                                                <div class="slider-config-section">
+                                                                    <label for="max-value-{sliderId}">Max Value</label>
+                                                                    <input 
+                                                                        id="max-value-{sliderId}"
+                                                                        type="number" 
+                                                                        min="0" 
+                                                                        max="127" 
+                                                                        bind:value={sliderConfig.max_midi_value}
+                                                                        onchange={(e) => {
+                                                                            let max = parseInt(e.target.value);
+                                                                            max = Math.max(0, Math.min(127, max));
+                                                                            // Ensure max >= min
+                                                                            if (max < sliderConfig.min_midi_value) {
+                                                                                max = sliderConfig.min_midi_value;
+                                                                            }
+                                                                            updateSliderConfig(sliderId, { max_midi_value: max });
+                                                                        }}
+                                                                    />
+                                                                </div>
+                                                            </div>
+                                                        </div>
+                                                    {/if}
+                                                {:else if isPotentiometerCell(rowIndex, colIndex)}
+                                                    <!-- Potentiometer component - uses same backend as sliders -->
+                                                    {@const sliderId = sliderIdForCell(rowIndex, colIndex)}
+                                                    {@const sliderValue = getSliderValue(sliderId)}
+                                                    {@const sliderConfig = getSliderConfig(sliderId)}
+                                                    {@const potAngle = getPotentiometerAngle(sliderId)}
+                                                    <button
+                                                        class="potentiometer-container"
+                                                        onclick={(event) => toggleSliderMenu(rowIndex, colIndex, event)}
+                                                        aria-label={`Potentiometer ${sliderId} at R${rowIndex}C${colIndex}, value ${sliderValue}`}
+                                                    >
+                                                        <div class="potentiometer-progress" style="--progress: {((sliderValue - sliderConfig.min_midi_value) / (sliderConfig.max_midi_value - sliderConfig.min_midi_value)) * 270}deg;"></div>
+                                                        <div class="potentiometer-indicator" style="transform: translateX(-50%) rotate({potAngle}deg);"></div>
+                                                        <div class="potentiometer-text">
+                                                            <div>CH{sliderConfig.midi_channel + 1}</div>
+                                                            <div>CC{sliderConfig.midi_cc}</div>
+                                                            <div>{sliderValue}</div>
+                                                        </div>
+                                                    </button>
+                                                    
+                                                    <!-- Potentiometer Configuration Menu (reuses slider menu) -->
+                                                    {#if activeSliderMenu && activeSliderMenu.row === rowIndex && activeSliderMenu.col === colIndex}
+                                                        <div class="slider-menu active">
+                                                            <div class="slider-config-panel">
+                                                                <h3>Potentiometer Configuration</h3>
+                                                                <div class="slider-config-section">
+                                                                    <label for="midi-channel-{sliderId}">MIDI Channel</label>
+                                                                    <input 
+                                                                        id="midi-channel-{sliderId}"
+                                                                        type="number" 
+                                                                        min="1" 
+                                                                        max="16" 
+                                                                        value={sliderConfig.midi_channel + 1}
+                                                                        onchange={(e) => {
+                                                                            let ch = parseInt(e.target.value) - 1;
+                                                                            ch = Math.max(0, Math.min(15, ch));
+                                                                            updateSliderConfig(sliderId, { midi_channel: ch });
+                                                                        }}
+                                                                    />
+                                                                </div>
+                                                                <div class="slider-config-section">
+                                                                    <label for="midi-cc-{sliderId}">CC Number</label>
+                                                                    <input 
+                                                                        id="midi-cc-{sliderId}"
+                                                                        type="number" 
+                                                                        min="0" 
+                                                                        max="127" 
+                                                                        bind:value={sliderConfig.midi_cc}
+                                                                        onchange={(e) => {
+                                                                            let cc = parseInt(e.target.value);
+                                                                            cc = Math.max(0, Math.min(127, cc));
+                                                                            updateSliderConfig(sliderId, { midi_cc: cc });
+                                                                        }}
+                                                                    />
+                                                                </div>
+                                                                <div class="slider-config-section">
+                                                                    <label for="min-value-{sliderId}">Min Value</label>
+                                                                    <input 
+                                                                        id="min-value-{sliderId}"
+                                                                        type="number" 
+                                                                        min="0" 
+                                                                        max="127" 
+                                                                        bind:value={sliderConfig.min_midi_value}
+                                                                        onchange={(e) => {
+                                                                            let min = parseInt(e.target.value);
+                                                                            min = Math.max(0, Math.min(127, min));
+                                                                            if (min > sliderConfig.max_midi_value) {
+                                                                                min = sliderConfig.max_midi_value;
+                                                                            }
+                                                                            updateSliderConfig(sliderId, { min_midi_value: min });
+                                                                        }}
+                                                                    />
+                                                                </div>
+                                                                <div class="slider-config-section">
+                                                                    <label for="max-value-{sliderId}">Max Value</label>
+                                                                    <input 
+                                                                        id="max-value-{sliderId}"
+                                                                        type="number" 
+                                                                        min="0" 
+                                                                        max="127" 
+                                                                        bind:value={sliderConfig.max_midi_value}
+                                                                        onchange={(e) => {
+                                                                            let max = parseInt(e.target.value);
+                                                                            max = Math.max(0, Math.min(127, max));
+                                                                            if (max < sliderConfig.min_midi_value) {
+                                                                                max = sliderConfig.min_midi_value;
+                                                                            }
+                                                                            updateSliderConfig(sliderId, { max_midi_value: max });
+                                                                        }}
+                                                                    />
+                                                                </div>
+                                                            </div>
+                                                        </div>
+                                                    {/if}
+                                                {:else if isEncoderCell(rowIndex, colIndex)}
                                                     <button
                                                         class="key encoder-key"
                                                         class:menu-open={activeEncoderMenu && activeEncoderMenu.row === rowIndex && activeEncoderMenu.col === colIndex}
@@ -1964,43 +2662,23 @@
                                                     <div class={`encoder-menu ${activeEncoderMenu && activeEncoderMenu.row === rowIndex && activeEncoderMenu.col === colIndex ? 'active' : ''}`}>
                                                         {#if activeEncoderMenu && activeEncoderMenu.row === rowIndex && activeEncoderMenu.col === colIndex}
                                                             {@const encoderId = encoderIdForCell(rowIndex, colIndex)}
-                                                            {@const encoderEntry = getEncoderEntryById(encoderId)}
-                                                            <button class="encoder-action ccw" onclick={(event) => handleEncoderAction(rowIndex, colIndex, 'ccw', event)}>
-                                                                <div class="encoder-action-header">
-                                                                    <span class="encoder-action-icon">⟲</span>
-                                                                    <span class="encoder-action-label">CCW</span>
+                                                            <div class="encoder-config-panel">
+                                                                <h3>Encoder Configuration</h3>
+                                                                <div class="encoder-config-section">
+                                                                    <label>Clockwise (CW)</label>
+                                                                    <button class="encoder-action-button" onclick={(event) => handleEncoderAction(rowIndex, colIndex, 'cw', event)}>
+                                                                        <span class="encoder-action-icon">⟳</span>
+                                                                        <span class="encoder-action-key">Up Arrow</span>
+                                                                    </button>
                                                                 </div>
-                                                                <div class="encoder-action-preview">
-                                                                    {#each formatKeyLabel(encoderEntry?.ccw_keycode ?? 0) as line}
-                                                                        <div class="preview-line">{line}</div>
-                                                                    {/each}
+                                                                <div class="encoder-config-section">
+                                                                    <label>Counter-Clockwise (CCW)</label>
+                                                                    <button class="encoder-action-button" onclick={(event) => handleEncoderAction(rowIndex, colIndex, 'ccw', event)}>
+                                                                        <span class="encoder-action-icon">⟲</span>
+                                                                        <span class="encoder-action-key">Down Arrow</span>
+                                                                    </button>
                                                                 </div>
-                                                            </button>
-                                                            <button class="encoder-action press" onclick={(event) => handleEncoderAction(rowIndex, colIndex, 'press', event)}>
-                                                                <div class="encoder-action-header">
-                                                                    <svg class="encoder-action-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                                                        <path d="M9 3V6H4V9L12 17L20 9V6H15V3H9Z" fill="currentColor"/>
-                                                                        <path d="M12 17L6 20V22H18V20L12 17Z" fill="currentColor" opacity="0.6"/>
-                                                                    </svg>
-                                                                    <span class="encoder-action-label">Press</span>
-                                                                </div>
-                                                                <div class="encoder-action-preview">
-                                                                    {#each formatKeyLabel(key?.keycode ?? 0) as line}
-                                                                        <div class="preview-line">{line}</div>
-                                                                    {/each}
-                                                                </div>
-                                                            </button>
-                                                            <button class="encoder-action cw" onclick={(event) => handleEncoderAction(rowIndex, colIndex, 'cw', event)}>
-                                                                <div class="encoder-action-header">
-                                                                    <span class="encoder-action-icon">⟳</span>
-                                                                    <span class="encoder-action-label">CW</span>
-                                                                </div>
-                                                                <div class="encoder-action-preview">
-                                                                    {#each formatKeyLabel(encoderEntry?.cw_keycode ?? 0) as line}
-                                                                        <div class="preview-line">{line}</div>
-                                                                    {/each}
-                                                                </div>
-                                                            </button>
+                                                            </div>
                                                         {/if}
                                                     </div>
                                                 {:else}
@@ -2015,14 +2693,15 @@
                                                     </button>
                                                 {/if}
                                             </div>
+                                            {/if}
                                         {/each}
                                     </div>
                                 {/each}
                             </div>
-                            {#if loadingKeymap || loadingEncoders}
+                            {#if loadingKeymap || loadingEncoders || loadingLayout}
                                 <div class="keymap-overlay" aria-live="polite">
                                     <div class="spinner spinner-small"></div>
-                                    <span>Loading layout…</span>
+                                    <span>{loadingLayout ? 'Detecting layout…' : 'Loading layout…'}</span>
                                 </div>
                             {/if}
                         </div>
@@ -3030,10 +3709,11 @@
 
     .keymap {
         position: relative;
-        display: flex;
-        flex-direction: column;
+        display: grid;
+        grid-template-columns: repeat(var(--board-cols, 3), 64px); /* Dynamic columns based on board layout */
         gap: 4px;
         transition: opacity 0.2s ease;
+        justify-content: center;
     }
 
     .keymap.loading {
@@ -3041,8 +3721,7 @@
     }
 
     .keymap-row {
-        display: flex;
-        gap: 4px;
+        display: contents; /* Allow grid items to be placed directly */
     }
 
     .keymap-cell {
@@ -3059,16 +3738,7 @@
         isolation: isolate;
     }
 
-    .keymap-card.has-active-menu::before {
-        content: '';
-        position: absolute;
-        inset: 0;
-        backdrop-filter: blur(3px);
-        background: rgba(251, 251, 255, 0.3);
-        border-radius: 20px;
-        z-index: 50;
-        pointer-events: none;
-    }
+   
 
     .key {
         width: 100%;
@@ -3179,19 +3849,89 @@
 
     .encoder-menu {
         position: absolute;
-        inset: 0;
-        display: flex;
-        align-items: center;
-        justify-content: center;
+        top: 50%;
+        transform: translateY(-50%);
+        left: 100%;
+        margin-left: 12px;
+        z-index: 200;
         opacity: 0;
         pointer-events: none;
-        transition: opacity 0.18s ease;
-        z-index: 100;
+        transition: opacity 0.2s ease;
     }
 
     .encoder-menu.active {
         opacity: 1;
         pointer-events: auto;
+    }
+
+    .encoder-config-panel {
+        width: 280px;
+        padding: 20px;
+        background: #ffffff;
+        border: 1px solid #d1d1d6;
+        border-radius: 16px;
+        box-shadow: 
+            0 8px 32px rgba(0, 0, 0, 0.12),
+            0 0 0 1px rgba(0, 0, 0, 0.04);
+    }
+
+    .encoder-config-panel h3 {
+        margin: 0 0 16px 0;
+        font-size: 16px;
+        font-weight: 600;
+        color: #1d1d1f;
+    }
+
+    .encoder-config-section {
+        margin-bottom: 16px;
+    }
+
+    .encoder-config-section:last-child {
+        margin-bottom: 0;
+    }
+
+    .encoder-config-section label {
+        display: block;
+        margin-bottom: 8px;
+        font-size: 14px;
+        font-weight: 500;
+        color: #424245;
+    }
+
+    .encoder-action-button {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        width: 100%;
+        padding: 12px;
+        background: #f2f2f7;
+        border: 1px solid #d1d1d6;
+        border-radius: 8px;
+        cursor: pointer;
+        transition: all 0.2s ease;
+    }
+
+    .encoder-action-button:hover {
+        background: #e5e5ea;
+        border-color: #007aff;
+        transform: translateY(-1px);
+        box-shadow: 0 2px 8px rgba(0, 122, 255, 0.15);
+    }
+
+    .encoder-action-button:active {
+        transform: translateY(0);
+        box-shadow: 0 1px 4px rgba(0, 122, 255, 0.2);
+    }
+
+    .encoder-action-icon {
+        font-size: 18px;
+        color: #007aff;
+    }
+
+    .encoder-action-key {
+        font-size: 14px;
+        font-weight: 500;
+        color: #1d1d1f;
     }
 
     .encoder-action {
@@ -3292,6 +4032,341 @@
 
     .encoder-action-preview .preview-line {
         white-space: nowrap;
+    }
+
+    /* Slider Styles */
+    .slider-cell {
+        /* Override grid cell sizing for sliders */
+        width: 64px;
+        height: 336px; /* 5 rows × 64px + 4 gaps × 4px = 320px + 16px = 336px */
+        grid-row: span 5; /* Make it span 5 rows in the grid */
+    }
+
+    .slider-container {
+        width: 100%;
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 8px;
+        padding: 8px;
+        background: #ffffff;
+        border: 1px solid #d1d1d6;
+        border-radius: 12px;
+        position: relative;
+        cursor: pointer;
+        box-shadow: 
+            0 1px 3px rgba(0, 0, 0, 0.04),
+            0 0 0 1px rgba(0, 0, 0, 0.02);
+    }
+
+    .slider-track {
+        width: 16px;
+        height: 280px; /* Taller track to better fill the 5-row space */
+        background: #f2f2f7;
+        border-radius: 16px;
+        position: relative;
+        border: 1px solid #d1d1d6;
+    }
+
+    .slider-thumb {
+        width: 32px;
+        height: 12px;
+        background: #ffffff;
+        border: 2px solid #007aff;
+        border-radius: 6px;
+        position: absolute;
+        left: 50%;
+        transform: translateX(-50%);
+        transition: bottom 0.15s ease;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+    }
+
+    .slider-info {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 2px;
+        font-size: 10px;
+        color: #1d1d1f;
+    }
+
+    .slider-value {
+        font-weight: 600;
+        font-size: 12px;
+        color: #007aff;
+    }
+
+    .slider-range {
+        color: #86868b;
+        font-size: 9px;
+    }
+
+    .unsaved-indicator {
+        color: #ff9500;
+        font-size: 8px;
+        line-height: 1;
+        margin-top: 1px;
+    }
+
+    .slider-cc {
+        font-weight: 500;
+        color: #000000;
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-size: 9px;
+    }
+
+    .slider-channel {
+        font-weight: 500;
+        color: #000000;
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-size: 9px;
+    }
+
+    .slider-container:hover {
+        border-color: rgba(0, 122, 255, 0.5);
+        transform: translateY(-1px);
+        box-shadow: 
+            0 4px 12px rgba(0, 122, 255, 0.12),
+            0 0 0 1px rgba(0, 122, 255, 0.2);
+    }
+
+    /* Potentiometer Styles */
+    .potentiometer-cell {
+        width: 64px;
+        height: 64px;
+    }
+
+    .potentiometer-container {
+        width: 100%;
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        background: #ffffff;
+        border: 1px solid #d1d1d6;
+        border-radius: 50%;
+        position: relative;
+        cursor: pointer;
+        box-shadow: 
+            0 1px 3px rgba(0, 0, 0, 0.04),
+            0 0 0 1px rgba(0, 0, 0, 0.02);
+    }
+
+    .potentiometer-progress {
+        position: absolute;
+        top: -12px;
+        left: -12px;
+        width: calc(100% + 24px);
+        height: calc(100% + 24px);
+        border-radius: 50%;
+        background: conic-gradient(
+            from -135deg,
+            #007aff 0deg,
+            #007aff var(--progress, 0deg),
+            transparent var(--progress, 0deg)
+        );
+        mask: radial-gradient(circle, transparent calc(50% - 3px), white calc(50% - 3px), white calc(50% + 1px), transparent calc(50% + 1px));
+        -webkit-mask: radial-gradient(circle, transparent calc(50% - 3px), white calc(50% - 3px), white calc(50% + 1px), transparent calc(50% + 1px));
+        z-index: 0;
+    }
+
+    .potentiometer-text {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 1px;
+        font-size: 9px;
+        color: #1d1d1f;
+        font-weight: 500;
+        z-index: 5;
+        pointer-events: none;
+    }
+
+    .potentiometer-text > div {
+        color: #1d1d1f;
+        padding: 1px 3px;
+        border-radius: 3px;
+        font-size: 8px;
+        line-height: 1;
+    }
+
+    .potentiometer-indicator {
+        width: 5px;
+        height: 15px;
+        background: #007aff;
+        position: absolute;
+        top: -4px;
+        left: 50%;
+        transform-origin: center 36px; /* Almost at the very edge of 64px button */
+        border-radius: 5px;
+        z-index: 10;
+    }
+
+    .potentiometer-knob {
+        display: none; /* Remove the inner knob completely */
+    }
+
+    .potentiometer-info {
+        position: relative;
+        z-index: 5;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 1px;
+        font-size: 8px;
+        color: #1d1d1f;
+        background: rgba(255, 255, 255, 0.95);
+        padding: 4px 6px;
+        border-radius: 8px;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+        border: 1px solid rgba(209, 209, 214, 0.5);
+    }
+
+    .potentiometer-value {
+        font-weight: 600;
+        font-size: 9px;
+        color: #007aff;
+    }
+
+    .potentiometer-range {
+        color: #86868b;
+        font-size: 7px;
+    }
+
+    .potentiometer-cc {
+        font-weight: 500;
+        color: #000000;
+        background: #f2f2f7;
+        padding: 1px 3px;
+        border-radius: 3px;
+        font-size: 7px;
+    }
+
+    .potentiometer-channel {
+        font-weight: 500;
+        color: #000000;
+        background: #e1f5fe;
+        padding: 1px 3px;
+        border-radius: 3px;
+        font-size: 7px;
+    }
+
+    .potentiometer-container:hover {
+        border-color: rgba(0, 122, 255, 0.5);
+        transform: translateY(-1px);
+        box-shadow: 
+            0 4px 12px rgba(0, 122, 255, 0.12),
+            0 0 0 1px rgba(0, 122, 255, 0.2);
+    }
+
+    .potentiometer-container:hover .potentiometer-info {
+        opacity: 1;
+        visibility: visible;
+    }
+
+    /* Slider Menu */
+    .slider-menu {
+        position: absolute;
+        top: 50%;
+        transform: translateY(-50%);
+        left: 100%;
+        margin-left: 12px;
+        z-index: 200;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.2s ease;
+    }
+
+    .slider-menu.active {
+        opacity: 1;
+        pointer-events: auto;
+    }
+
+    .slider-config-panel {
+        width: 280px;
+        padding: 20px;
+        background: #ffffff;
+        border: 1px solid #d1d1d6;
+        border-radius: 16px;
+        box-shadow: 
+            0 8px 32px rgba(0, 0, 0, 0.12),
+            0 0 0 1px rgba(0, 0, 0, 0.04);
+    }
+
+    .save-button {
+        width: 100%;
+        padding: 12px 16px;
+        border: none;
+        border-radius: 8px;
+        font-size: 14px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.2s ease;
+        margin-top: 8px;
+    }
+
+    .save-button:disabled {
+        background: #f5f5f7;
+        color: #8e8e93;
+        cursor: not-allowed;
+    }
+
+    .save-button.has-changes {
+        background: #007aff;
+        color: white;
+    }
+
+    .save-button.has-changes:hover {
+        background: #0056cc;
+    }
+
+    .slider-config-panel h3 {
+        margin: 0 0 16px 0;
+        font-size: 16px;
+        font-weight: 600;
+        color: #1d1d1f;
+    }
+
+    .slider-config-section {
+        margin-bottom: 16px;
+    }
+
+    .slider-config-section label {
+        display: block;
+        font-size: 12px;
+        font-weight: 500;
+        color: #86868b;
+        margin-bottom: 6px;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+    }
+
+    .slider-config-section input[type="number"] {
+        width: 100%;
+        padding: 8px 12px;
+        border: 1px solid #d1d1d6;
+        border-radius: 8px;
+        font-size: 14px;
+        background: #ffffff;
+        color: #1d1d1f;
+    }
+
+
+
+    .slider-config-section span {
+        font-weight: 600;
+        color: #007aff;
+        min-width: 40px;
+        display: inline-block;
+        text-align: right;
     }
 
     .keymap-container .spinner-small {

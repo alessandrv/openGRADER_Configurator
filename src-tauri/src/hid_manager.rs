@@ -462,6 +462,7 @@ impl HidManager {
                 encoders_per_row: 2,
                 bitmap_length: 1,
                 encoder_bitmap: vec![0b00111100],
+                layout: Vec::new(), // Mock layout would need to be populated too
             });
         }
 
@@ -471,7 +472,124 @@ impl HidManager {
             return Err(format!("Device returned error: {:?}", status));
         }
 
-        BoardLayoutInfo::from_payload(&response.payload[..response.payload_length as usize])
+        let mut layout_info = BoardLayoutInfo::from_payload(&response.payload[..response.payload_length as usize])?;
+        
+        // Populate the layout cells by querying each position
+        let total_cells = (layout_info.matrix_rows as usize) * (layout_info.matrix_cols as usize);
+        layout_info.layout = Vec::with_capacity(total_cells);
+        
+        for row in 0..layout_info.matrix_rows {
+            for col in 0..layout_info.matrix_cols {
+                let cell_type_raw = self.get_layout_cell_type(row, col).await.unwrap_or(0);
+                let component_id = self.get_layout_cell_component_id(row, col).await.unwrap_or(0);
+                
+                let cell_type = LayoutCellType::from_u8(cell_type_raw).unwrap_or(LayoutCellType::Empty);
+                
+                layout_info.layout.push(LayoutCell {
+                    cell_type,
+                    component_id,
+                });
+            }
+        }
+        
+        Ok(layout_info)
+    }
+
+    /// Get layout cell type at specific matrix position
+    pub async fn get_layout_cell_type(&self, row: u8, col: u8) -> Result<u8, String> {
+        if *self.is_mock_device.lock().unwrap() {
+            // Mock data: switches in first 2 columns, encoders in columns 2-3
+            return Ok(if col < 2 { 1 } else { 2 }); // 1=Switch, 2=Encoder
+        }
+
+        let payload = [row, col];
+        let response = self.send_command(ConfigCommand::GetLayoutCellType, &payload).await?;
+        let status = StatusCode::from(response.status);
+        if !matches!(status, StatusCode::Ok) {
+            return Err(format!("Device returned error: {:?}", status));
+        }
+
+        if response.payload_length < 1 {
+            return Err("Invalid response payload length".to_string());
+        }
+
+        Ok(response.payload[0])
+    }
+
+    /// Get layout cell component ID at specific matrix position
+    pub async fn get_layout_cell_component_id(&self, row: u8, col: u8) -> Result<u8, String> {
+        if *self.is_mock_device.lock().unwrap() {
+            // Mock data: return sequential IDs
+            return Ok(row * 4 + col);
+        }
+
+        let payload = [row, col];
+        let response = self.send_command(ConfigCommand::GetLayoutCellComponentId, &payload).await?;
+        let status = StatusCode::from(response.status);
+        if !matches!(status, StatusCode::Ok) {
+            return Err(format!("Device returned error: {:?}", status));
+        }
+
+        if response.payload_length < 1 {
+            return Err("Invalid response payload length".to_string());
+        }
+
+        Ok(response.payload[0])
+    }
+
+    /// Get current slider value
+    pub async fn get_slider_value(&self, slider_id: u8) -> Result<u8, String> {
+        let payload = [slider_id];
+        let response = self.send_command(ConfigCommand::GetSliderValue, &payload).await?;
+        let status = StatusCode::from(response.status);
+        if !matches!(status, StatusCode::Ok) {
+            return Err(format!("Device returned error: {:?}", status));
+        }
+
+        if response.payload_length < 1 {
+            return Err("Invalid response payload length".to_string());
+        }
+
+        Ok(response.payload[0])
+    }
+
+    /// Get slider configuration
+    pub async fn get_slider_config(&self, layer: u8, slider_id: u8) -> Result<SliderConfig, String> {
+        let payload = [layer, slider_id];
+        let response = self.send_command(ConfigCommand::GetSliderConfig, &payload).await?;
+        let status = StatusCode::from(response.status);
+        if !matches!(status, StatusCode::Ok) {
+            return Err(format!("Device returned error: {:?}", status));
+        }
+
+        // Debug: log payload length and first bytes to help diagnose mismatches
+        println!("DEBUG get_slider_config: layer={} slider_id={} status_byte=0x{:02X} payload_length={}",
+                 layer, slider_id, response.status, response.payload_length);
+        // Print first up to 16 bytes of payload for inspection
+        let len = response.payload_length as usize;
+        let show_len = if len > 16 { 16 } else { len };
+        if show_len > 0 {
+            let slice = &response.payload[..show_len];
+            print!("DEBUG payload first bytes:");
+            for b in slice {
+                print!(" {:02X}", b);
+            }
+            println!();
+        }
+
+        SliderConfig::from_payload(&response.payload[..response.payload_length as usize])
+    }
+
+    /// Set slider configuration
+    pub async fn set_slider_config(&self, config: &SliderConfig) -> Result<(), String> {
+        let payload = config.to_payload();
+        let response = self.send_command(ConfigCommand::SetSliderConfig, &payload).await?;
+        let status = StatusCode::from(response.status);
+        if !matches!(status, StatusCode::Ok) {
+            return Err(format!("Device returned error: {:?}", status));
+        }
+
+        Ok(())
     }
 
     /// Get device information

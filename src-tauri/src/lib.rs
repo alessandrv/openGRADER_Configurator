@@ -47,8 +47,15 @@ pub fn run() {
             load_full_state,
             get_enhanced_connection_status,
             get_board_layout,
+            get_layout_cell_type,
+            get_layout_cell_component_id,
             get_layer_state,
             set_layer_state,
+            
+            // Slider management
+            get_slider_value,
+            get_slider_config,
+            set_slider_config,
             
             // Keymap management
             get_keymap_entry,

@@ -1,5 +1,5 @@
 use crate::hid_manager::{HidManager, DeviceDescriptor};
-use crate::protocol::{DeviceInfo, KeymapEntry, EncoderEntry, I2CDeviceInfo, SlaveKeymapEntry, SlaveEncoderEntry, BoardLayoutInfo, LayerState};
+use crate::protocol::{DeviceInfo, KeymapEntry, EncoderEntry, I2CDeviceInfo, SlaveKeymapEntry, SlaveEncoderEntry, BoardLayoutInfo, LayerState, LayoutCellType, LayoutCell, SliderConfig};
 use std::sync::Arc;
 use tauri::{AppHandle, State, Emitter};
 use tokio::sync::RwLock;
@@ -82,6 +82,36 @@ pub async fn ping_device(state: State<'_, AppState>) -> Result<bool, String> {
 pub async fn get_board_layout(state: State<'_, AppState>) -> Result<BoardLayoutInfo, String> {
     let manager = state.read().await;
     manager.get_board_layout().await
+}
+
+#[tauri::command]
+pub async fn get_layout_cell_type(row: u8, col: u8, state: State<'_, AppState>) -> Result<u8, String> {
+    let manager = state.read().await;
+    manager.get_layout_cell_type(row, col).await
+}
+
+#[tauri::command]
+pub async fn get_layout_cell_component_id(row: u8, col: u8, state: State<'_, AppState>) -> Result<u8, String> {
+    let manager = state.read().await;
+    manager.get_layout_cell_component_id(row, col).await
+}
+
+#[tauri::command]
+pub async fn get_slider_value(slider_id: u8, state: State<'_, AppState>) -> Result<u8, String> {
+    let manager = state.read().await;
+    manager.get_slider_value(slider_id).await
+}
+
+#[tauri::command]
+pub async fn get_slider_config(layer: u8, slider_id: u8, state: State<'_, AppState>) -> Result<SliderConfig, String> {
+    let manager = state.read().await;
+    manager.get_slider_config(layer, slider_id).await
+}
+
+#[tauri::command]
+pub async fn set_slider_config(config: SliderConfig, state: State<'_, AppState>) -> Result<(), String> {
+    let manager = state.read().await;
+    manager.set_slider_config(&config).await
 }
 
 #[tauri::command]

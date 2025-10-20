@@ -36,6 +36,12 @@ pub enum ConfigCommand {
     GetLayoutInfo = 0x16,
     SetLayerState = 0x17,
     GetLayerState = 0x18,
+    GetLayoutCellType = 0x19,
+    GetLayoutCellComponentId = 0x1A,
+    // Slider commands
+    GetSliderValue = 0x1B,
+    GetSliderConfig = 0x1C,
+    SetSliderConfig = 0x1D,
 }
                          
 impl From<u8> for ConfigCommand {
@@ -65,6 +71,11 @@ impl From<u8> for ConfigCommand {
             0x16 => ConfigCommand::GetLayoutInfo,
             0x17 => ConfigCommand::SetLayerState,
             0x18 => ConfigCommand::GetLayerState,
+            0x19 => ConfigCommand::GetLayoutCellType,
+            0x1A => ConfigCommand::GetLayoutCellComponentId,
+            0x1B => ConfigCommand::GetSliderValue,
+            0x1C => ConfigCommand::GetSliderConfig,
+            0x1D => ConfigCommand::SetSliderConfig,
             _ => ConfigCommand::GetInfo, // Default fallback
         }
     }
@@ -414,6 +425,35 @@ impl LayerState {
     }
 }
 
+/// Layout cell types (matches firmware layout_cell_type_t)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum LayoutCellType {
+    Empty = 0,
+    Switch = 1,
+    Encoder = 2,
+    Slider = 3,
+}
+
+impl LayoutCellType {
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(LayoutCellType::Empty),
+            1 => Some(LayoutCellType::Switch),
+            2 => Some(LayoutCellType::Encoder),
+            3 => Some(LayoutCellType::Slider),
+            _ => None,
+        }
+    }
+}
+
+/// Layout cell definition (matches firmware layout_cell_t)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayoutCell {
+    pub cell_type: LayoutCellType,
+    pub component_id: u8,
+}
+
 /// Board layout metadata structure (matches firmware board_layout_info_t)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoardLayoutInfo {
@@ -425,6 +465,7 @@ pub struct BoardLayoutInfo {
     pub encoders_per_row: u8,
     pub bitmap_length: u8,
     pub encoder_bitmap: Vec<u8>,
+    pub layout: Vec<LayoutCell>, // Complete layout with all cells populated
 }
 
 impl BoardLayoutInfo {
@@ -455,6 +496,7 @@ impl BoardLayoutInfo {
             encoders_per_row: payload[5],
             bitmap_length: payload[6],
             encoder_bitmap: bitmap,
+            layout: Vec::new(), // Will be populated later by the HID manager
         })
     }
 
@@ -499,5 +541,46 @@ impl BoardLayoutInfo {
         } else {
             None
         }
+    }
+}
+
+/// Slider configuration structure (matches firmware slider_config_t)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SliderConfig {
+    pub layer: u8,
+    pub slider_id: u8,
+    pub midi_cc: u8,
+    pub midi_channel: u8,
+    pub min_midi_value: u8,
+    pub max_midi_value: u8,
+}
+
+impl SliderConfig {
+    pub fn from_payload(payload: &[u8]) -> Result<Self, String> {
+        if payload.len() < 8 {
+            return Err("Slider config payload too short".to_string());
+        }
+
+        Ok(SliderConfig {
+            layer: payload[0],
+            slider_id: payload[1],
+            midi_cc: payload[2],
+            midi_channel: payload[3],
+            min_midi_value: payload[4],
+            max_midi_value: payload[5],
+            // payload[6] and payload[7] are reserved
+        })
+    }
+
+    pub fn to_payload(&self) -> Vec<u8> {
+        vec![
+            self.layer,
+            self.slider_id,
+            self.midi_cc,
+            self.midi_channel,
+            self.min_midi_value,
+            self.max_midi_value,
+            0, 0, // reserved bytes to match firmware structure
+        ]
     }
 }
