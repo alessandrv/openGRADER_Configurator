@@ -42,6 +42,12 @@ pub enum ConfigCommand {
     GetSliderValue = 0x1B,
     GetSliderConfig = 0x1C,
     SetSliderConfig = 0x1D,
+    // Magnetic switch commands
+    GetMagneticSwitchValue = 0x1E,
+    GetMagneticSwitchConfig = 0x1F,
+    SetMagneticSwitchConfig = 0x20,
+    CalibrateMagneticSwitch = 0x21,
+    SetMagneticSwitchSensitivity = 0x22,
 }
                          
 impl From<u8> for ConfigCommand {
@@ -76,6 +82,11 @@ impl From<u8> for ConfigCommand {
             0x1B => ConfigCommand::GetSliderValue,
             0x1C => ConfigCommand::GetSliderConfig,
             0x1D => ConfigCommand::SetSliderConfig,
+            0x1E => ConfigCommand::GetMagneticSwitchValue,
+            0x1F => ConfigCommand::GetMagneticSwitchConfig,
+            0x20 => ConfigCommand::SetMagneticSwitchConfig,
+            0x21 => ConfigCommand::CalibrateMagneticSwitch,
+            0x22 => ConfigCommand::SetMagneticSwitchSensitivity,
             _ => ConfigCommand::GetInfo, // Default fallback
         }
     }
@@ -433,6 +444,8 @@ pub enum LayoutCellType {
     Switch = 1,
     Encoder = 2,
     Slider = 3,
+    Potentiometer = 4,
+    MagneticSwitch = 5,
 }
 
 impl LayoutCellType {
@@ -442,6 +455,8 @@ impl LayoutCellType {
             1 => Some(LayoutCellType::Switch),
             2 => Some(LayoutCellType::Encoder),
             3 => Some(LayoutCellType::Slider),
+            4 => Some(LayoutCellType::Potentiometer),
+            5 => Some(LayoutCellType::MagneticSwitch),
             _ => None,
         }
     }
@@ -582,5 +597,47 @@ impl SliderConfig {
             self.max_midi_value,
             0, 0, // reserved bytes to match firmware structure
         ]
+    }
+}
+
+/// Magnetic switch configuration structure (matches firmware magnetic_switch_config_t)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MagneticSwitchConfig {
+    pub layer: u8,
+    pub switch_id: u8,
+    pub unpressed_value: u16,
+    pub pressed_value: u16,
+    pub sensitivity: u8,
+    pub keycode: u16,
+    pub is_calibrated: bool,
+}
+
+impl MagneticSwitchConfig {
+    pub fn from_payload(payload: &[u8]) -> Result<Self, String> {
+        if payload.len() < 10 {
+            return Err("Magnetic switch config payload too short".to_string());
+        }
+
+        Ok(MagneticSwitchConfig {
+            layer: payload[0],
+            switch_id: payload[1],
+            unpressed_value: u16::from_le_bytes([payload[2], payload[3]]),
+            pressed_value: u16::from_le_bytes([payload[4], payload[5]]),
+            sensitivity: payload[6],
+            keycode: u16::from_le_bytes([payload[7], payload[8]]),
+            is_calibrated: payload[9] != 0,
+        })
+    }
+
+    pub fn to_payload(&self) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.push(self.layer);
+        payload.push(self.switch_id);
+        payload.extend_from_slice(&self.unpressed_value.to_le_bytes());
+        payload.extend_from_slice(&self.pressed_value.to_le_bytes());
+        payload.push(self.sensitivity);
+        payload.extend_from_slice(&self.keycode.to_le_bytes());
+        payload.push(if self.is_calibrated { 1 } else { 0 });
+        payload
     }
 }

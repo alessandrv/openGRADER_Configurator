@@ -57,6 +57,13 @@ pub fn run() {
             get_slider_config,
             set_slider_config,
             
+            // Magnetic switch management
+            get_magnetic_switch_value,
+            get_magnetic_switch_config,
+            set_magnetic_switch_config,
+            calibrate_magnetic_switch,
+            set_magnetic_switch_sensitivity,
+            
             // Keymap management
             get_keymap_entry,
             set_keymap_entry,

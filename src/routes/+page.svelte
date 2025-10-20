@@ -43,6 +43,12 @@
     let sliderValues = $state({}); // Map of slider ID -> current value (0-127)
     let sliderConfigs = $state({}); // Map of slider ID -> configuration
     
+    // Magnetic switch state
+    let magneticSwitchValues = $state({}); // Map of switch ID -> current value (0-100%)
+    let magneticSwitchConfigs = $state({}); // Map of switch ID -> configuration
+    let calibrationMode = $state({}); // Map of switch ID -> calibration state
+    let activeMagneticSwitchMenu = $state(null); // For magnetic switch configuration menu
+    
     let keycodes = {};
     let keycodeByName = {};
     
@@ -73,6 +79,7 @@
     let connectionCheckInterval = null;
     let layerStatePollInterval = null;
     let sliderPollInterval = null; // For real-time slider value updates
+    let magneticSwitchPollInterval = null; // For real-time magnetic switch value updates
 
     onMount(() => {
         console.log('=== FRONTEND: App started ===');
@@ -92,6 +99,8 @@
             stopAutoConnect();
             stopConnectionCheck();
             stopLayerStatePolling();
+            stopSliderPolling();
+            stopMagneticSwitchPolling();
         };
     });
     
@@ -224,6 +233,23 @@
         }
     }
     
+    function startMagneticSwitchPolling() {
+        if (magneticSwitchPollInterval) return;
+
+        magneticSwitchPollInterval = setInterval(() => {
+            if (isConnected) {
+                pollMagneticSwitchValues();
+            }
+        }, 50); // Poll every 50ms for responsive magnetic switch feedback
+    }
+
+    function stopMagneticSwitchPolling() {
+        if (magneticSwitchPollInterval) {
+            clearInterval(magneticSwitchPollInterval);
+            magneticSwitchPollInterval = null;
+        }
+    }
+    
     async function tryAutoConnect() {
         try {
             console.log('Attempting auto-connect...');
@@ -271,10 +297,18 @@
             // Initialize default slider data
             initializeSliderData();
             
+            // Initialize default magnetic switch data
+            initializeMagneticSwitchData();
+            
             // Load real slider config from device and get initial values for all sliders
             await loadAllSliderConfigs();
             await pollSliderValues(); // Get initial values immediately
             startSliderPolling();
+            
+            // Load magnetic switch configs and start polling
+            await loadAllMagneticSwitchConfigs();
+            await pollMagneticSwitchValues();
+            startMagneticSwitchPolling();
             
             activeEncoderMenu = null;
 
@@ -343,6 +377,7 @@
         stopConnectionCheck();
         stopLayerStatePolling();
         stopSliderPolling();
+        stopMagneticSwitchPolling();
         
         console.log('Device disconnected, will attempt to reconnect...');
     }
@@ -1113,6 +1148,7 @@
                             isEncoder: cellType === 2,
                             isSlider: cellType === 3,
                             isPotentiometer: cellType === 4,
+                            isMagneticSwitch: cellType === 5,
                             isEmpty: cellType === 0
                         });
                         
@@ -1122,6 +1158,7 @@
                         else if (cellType === 2) typeStr = 'ENC';
                         else if (cellType === 3) typeStr = 'SLIDER';
                         else if (cellType === 4) typeStr = 'POT';
+                        else if (cellType === 5) typeStr = 'MAG_SW';
                         console.log(`Layout (${row},${col}): ${typeStr} ID=${componentId}`);
                     } catch (e) {
                         console.error(`Failed to get layout for (${row},${col}):`, e);
@@ -1132,6 +1169,7 @@
                             isEncoder: false,
                             isSlider: false,
                             isPotentiometer: false,
+                            isMagneticSwitch: false,
                             isEmpty: true
                         });
                     }
@@ -1152,7 +1190,7 @@
     // Synchronous helper functions for template use
     function getLayoutCell(row, col) {
         if (!layoutMatrix || row >= layoutMatrix.length || col >= (layoutMatrix[row]?.length || 0)) {
-            return { type: 0, componentId: 0, isSwitch: false, isEncoder: false, isSlider: false, isPotentiometer: false, isEmpty: true };
+            return { type: 0, componentId: 0, isSwitch: false, isEncoder: false, isSlider: false, isPotentiometer: false, isMagneticSwitch: false, isEmpty: true };
         }
         return layoutMatrix[row][col];
     }
@@ -1305,6 +1343,10 @@
         return getLayoutCell(row, col).isPotentiometer;
     }
     
+    function isMagneticSwitchCell(row, col) {
+        return getLayoutCell(row, col).isMagneticSwitch;
+    }
+    
     function isEmptyCell(row, col) {
         return getLayoutCell(row, col).isEmpty;
     }
@@ -1362,6 +1404,46 @@
         return Math.max(minAngle, Math.min(maxAngle, angle));
     }
     
+    // Magnetic switch functions
+    // We need to map layout component IDs (component_id) to hardware indices (0..N-1)
+    // `magneticComponentToIndex` maps component_id -> hardware index used by firmware
+    let magneticComponentToIndex = {};
+
+    function magneticSwitchIdForCell(row, col) {
+        const compId = getComponentId(row, col);
+        if (compId === null || compId === undefined) return null;
+        // Return the hardware index (fallback to compId if mapping missing)
+        return magneticComponentToIndex.hasOwnProperty(compId) ? magneticComponentToIndex[compId] : null;
+    }
+    
+    function getMagneticSwitchValue(switchId) {
+        // Return actual value if available, otherwise 0 (which means no data yet)
+        return magneticSwitchValues[switchId] !== undefined ? magneticSwitchValues[switchId] : 0;
+    }
+    
+    function getMagneticSwitchConfig(switchId) {
+        return magneticSwitchConfigs[switchId] || {
+            layer: selectedLayer,
+            switch_id: switchId,
+            unpressed_value: 0,
+            pressed_value: 4095,
+            sensitivity: 50,
+            keycode: 0x04, // KC_A as default
+            is_calibrated: false
+        };
+    }
+    
+    function getMagneticSwitchPercentage(switchId) {
+        const value = getMagneticSwitchValue(switchId);
+        return Math.max(0, Math.min(100, value));
+    }
+    
+    function isMagneticSwitchPressed(switchId) {
+        const percentage = getMagneticSwitchPercentage(switchId);
+        const config = getMagneticSwitchConfig(switchId);
+        return percentage >= config.sensitivity;
+    }
+    
     function initializeSliderData() {
         // Initialize slider configurations and values based on board layout
         const sliderIds = [];
@@ -1416,6 +1498,67 @@
         });
         
         console.log('Initialized slider data:', { sliderConfigs, sliderValues, foundSliders: sliderIds });
+    }
+    
+    function initializeMagneticSwitchData() {
+        // Initialize magnetic switch configurations and values based on board layout
+        const magneticSwitchIds = [];
+        
+        // Get all magnetic switch IDs from the board layout
+        if (boardLayout && boardLayout.layout) {
+            for (let row = 0; row < (boardLayout.rows || boardLayout.matrix_rows); row++) {
+                for (let col = 0; col < (boardLayout.cols || boardLayout.matrix_cols); col++) {
+                    const cellIndex = row * (boardLayout.cols || boardLayout.matrix_cols) + col;
+                    const cell = boardLayout.layout[cellIndex];
+                    if (!cell) continue;
+
+                    const rawType = cell.type ?? cell.cell_type ?? cell.cellType ?? null;
+                    let isMagneticSwitch = false;
+                    if (rawType !== null && rawType !== undefined) {
+                        if (typeof rawType === 'number') {
+                            isMagneticSwitch = rawType === 5; // Magnetic switch type
+                        } else if (typeof rawType === 'string') {
+                            isMagneticSwitch = rawType.toLowerCase() === 'magneticswitch' || rawType.toLowerCase() === 'magnetic_switch';
+                        }
+                    }
+
+                    const compId = cell.component_id ?? cell.componentId ?? cell.componentid ?? cell.component ?? 0;
+                    if (isMagneticSwitch) {
+                        magneticSwitchIds.push(compId);
+                    }
+                }
+            }
+        }
+        
+        // If no magnetic switches found in layout, fallback to switch 0 for testing
+        if (magneticSwitchIds.length === 0) {
+            magneticSwitchIds.push(0);
+        }
+        
+        // Initialize configurations and values for all found magnetic switches
+        // Map component IDs to hardware indices (0..N-1). Firmware expects switch indices, not layout component IDs.
+        magneticSwitchConfigs = {};
+        magneticSwitchValues = {};
+        calibrationMode = {};
+        magneticComponentToIndex = {};
+
+        magneticSwitchIds.forEach((compId, index) => {
+            // hardware index is `index`
+            magneticComponentToIndex[compId] = index;
+            magneticSwitchConfigs[index] = {
+                layer: selectedLayer,
+                switch_id: index,
+                unpressed_value: 0,
+                pressed_value: 4095,
+                sensitivity: 50,
+                keycode: 0x04 + index, // KC_A, KC_B, KC_C, etc.
+                is_calibrated: false
+            };
+            magneticSwitchValues[index] = 0; // Start at unpressed
+            calibrationMode[index] = null;
+        });
+        
+        console.log('Initialized magnetic switch data:', { magneticSwitchConfigs, magneticSwitchValues, foundSwitches: magneticSwitchIds, mapping: magneticComponentToIndex });
     }
     
     // Real-time slider value polling
@@ -1503,12 +1646,99 @@
         console.log('Loaded all slider configs:', sliderConfigs);
     }
 
+    // Load configurations for all magnetic switches found in the layout
+    async function loadAllMagneticSwitchConfigs() {
+        if (!boardLayout) return;
+        
+        // Get all magnetic switch IDs from the board layout
+        const magneticSwitchIds = [];
+        if (boardLayout.layout) {
+            for (let row = 0; row < (boardLayout.rows || boardLayout.matrix_rows); row++) {
+                for (let col = 0; col < (boardLayout.cols || boardLayout.matrix_cols); col++) {
+                    const cellIndex = row * (boardLayout.cols || boardLayout.matrix_cols) + col;
+                    const cell = boardLayout.layout[cellIndex];
+                    if (!cell) continue;
+
+                    const rawType = cell.type ?? cell.cell_type ?? cell.cellType ?? null;
+                    let isMagneticSwitch = false;
+                    if (rawType !== null && rawType !== undefined) {
+                        if (typeof rawType === 'number') {
+                            isMagneticSwitch = rawType === 5; // Magnetic switch type
+                        } else if (typeof rawType === 'string') {
+                            isMagneticSwitch = rawType.toLowerCase() === 'magneticswitch' || rawType.toLowerCase() === 'magnetic_switch';
+                        }
+                    }
+
+                    const compId = cell.component_id ?? cell.componentId ?? cell.component ?? 0;
+                    if (isMagneticSwitch) {
+                        magneticSwitchIds.push(compId);
+                    }
+                }
+            }
+        }
+        
+        // If no magnetic switches found in layout, fallback to switch 0 for testing
+        if (magneticSwitchIds.length === 0) {
+            magneticSwitchIds.push(0);
+        }
+        
+        // Load configuration for each magnetic switch (use hardware index mapping)
+        for (const compId of magneticSwitchIds) {
+            const hwIndex = magneticComponentToIndex[compId];
+            if (hwIndex !== undefined && hwIndex !== null) {
+                await loadMagneticSwitchConfig(hwIndex);
+            }
+        }
+        
+        console.log('Loaded all magnetic switch configs:', magneticSwitchConfigs);
+    }
+
+    // Load configuration for a specific magnetic switch
+    async function loadMagneticSwitchConfig(switchId) {
+        try {
+            const config = await invoke('get_magnetic_switch_config', { 
+                layer: selectedLayer, 
+                switchId 
+            });
+            magneticSwitchConfigs[switchId] = config;
+        } catch (e) {
+            console.error(`Failed to load magnetic switch ${switchId} config:`, e);
+            // Keep default config if loading fails
+        }
+    }
+
+    // Poll all magnetic switch values
+    async function pollMagneticSwitchValues() {
+        if (!isConnected) return;
+        
+        try {
+            // Get all magnetic switch IDs from configs
+            const switchIds = Object.keys(magneticSwitchConfigs).map(id => parseInt(id));
+            
+            // Poll each magnetic switch's current value
+            for (const switchId of switchIds) {
+                try {
+                    const value = await invoke('get_magnetic_switch_value', { switchId });
+                    magneticSwitchValues[switchId] = value;
+                } catch (e) {
+                    console.error(`Failed to get magnetic switch ${switchId} value:`, e);
+                }
+            }
+        } catch (e) {
+            console.error('Failed to poll magnetic switch values:', e);
+        }
+    }
+
     function closeEncoderMenu() {
         activeEncoderMenu = null;
     }
     
     function closeSliderMenu() {
         activeSliderMenu = null;
+    }
+    
+    function closeMagneticSwitchMenu() {
+        activeMagneticSwitchMenu = null;
     }
     
     function toggleSliderMenu(row, col, event) {
@@ -1528,6 +1758,78 @@
         
         // Close encoder menu if open
         activeEncoderMenu = null;
+    }
+    
+    function toggleMagneticSwitchMenu(row, col, event) {
+        event.stopPropagation();
+        if (loadingEncoders || loadingKeymap || loadingLayout) {
+            return;
+        }
+        
+        const switchId = magneticSwitchIdForCell(row, col);
+        if (switchId === null || switchId === undefined) return;
+
+        if (activeMagneticSwitchMenu && activeMagneticSwitchMenu.row === row && activeMagneticSwitchMenu.col === col) {
+            activeMagneticSwitchMenu = null;
+        } else {
+            activeMagneticSwitchMenu = { row, col, switchId };
+        }
+        
+        // Close other menus if open
+        activeEncoderMenu = null;
+        activeSliderMenu = null;
+    }
+
+    // Magnetic switch calibration functions
+    async function startMagneticSwitchCalibration(switchId) {
+        try {
+            await invoke('calibrate_magnetic_switch', { switchId, step: 0 }); // Start calibration
+            calibrationMode[switchId] = 'ready';
+            console.log(`Started calibration for magnetic switch ${switchId}`);
+        } catch (e) {
+            console.error(`Failed to start calibration for magnetic switch ${switchId}:`, e);
+        }
+    }
+
+    async function setMagneticSwitchUnpressed(switchId) {
+        try {
+            await invoke('calibrate_magnetic_switch', { switchId, step: 1 }); // Set unpressed value
+            calibrationMode[switchId] = 'unpressed';
+            console.log(`Set unpressed value for magnetic switch ${switchId}`);
+        } catch (e) {
+            console.error(`Failed to set unpressed value for magnetic switch ${switchId}:`, e);
+        }
+    }
+
+    async function setMagneticSwitchPressed(switchId) {
+        try {
+            await invoke('calibrate_magnetic_switch', { switchId, step: 2 }); // Set pressed value
+            calibrationMode[switchId] = 'pressed';
+            console.log(`Set pressed value for magnetic switch ${switchId}`);
+        } catch (e) {
+            console.error(`Failed to set pressed value for magnetic switch ${switchId}:`, e);
+        }
+    }
+
+    async function completeMagneticSwitchCalibration(switchId) {
+        try {
+            await invoke('calibrate_magnetic_switch', { switchId, step: 3 }); // Complete calibration
+            calibrationMode[switchId] = 'complete';
+            await loadMagneticSwitchConfig(switchId); // Reload config to get updated values
+            console.log(`Completed calibration for magnetic switch ${switchId}`);
+        } catch (e) {
+            console.error(`Failed to complete calibration for magnetic switch ${switchId}:`, e);
+        }
+    }
+
+    async function setMagneticSwitchSensitivity(switchId, sensitivity) {
+        try {
+            await invoke('set_magnetic_switch_sensitivity', { switchId, sensitivity });
+            await loadMagneticSwitchConfig(switchId); // Reload config to get updated sensitivity
+            console.log(`Set sensitivity for magnetic switch ${switchId} to ${sensitivity}%`);
+        } catch (e) {
+            console.error(`Failed to set sensitivity for magnetic switch ${switchId}:`, e);
+        }
     }
     
     function updateSliderValue(sliderId, newValue) {
@@ -1578,14 +1880,16 @@
         // Close menus if clicked outside
         if (activeEncoderMenu) closeEncoderMenu();
         if (activeSliderMenu) closeSliderMenu();
+        if (activeMagneticSwitchMenu) closeMagneticSwitchMenu();
     }
 
     /** @param {KeyboardEvent} event */
     function handleGlobalKeydown(event) {
-        if (!activeEncoderMenu && !activeSliderMenu) return;
+        if (!activeEncoderMenu && !activeSliderMenu && !activeMagneticSwitchMenu) return;
         if (event.key === 'Escape') {
             if (activeEncoderMenu) closeEncoderMenu();
             if (activeSliderMenu) closeSliderMenu();
+            if (activeMagneticSwitchMenu) closeMagneticSwitchMenu();
         }
     }
 
@@ -2453,7 +2757,7 @@
                                     <div class="keymap-row">
                                         {#each row as key, colIndex}
                                             {#if !isEmptyCell(rowIndex, colIndex)}
-                                                <div class={`keymap-cell ${isEncoderCell(rowIndex, colIndex) ? 'encoder-cell' : ''} ${isSliderCell(rowIndex, colIndex) ? 'slider-cell' : ''} ${isPotentiometerCell(rowIndex, colIndex) ? 'potentiometer-cell' : ''} ${activeEncoderMenu && activeEncoderMenu.row === rowIndex && activeEncoderMenu.col === colIndex ? 'active-encoder' : ''}`}>
+                                                <div class={`keymap-cell ${isEncoderCell(rowIndex, colIndex) ? 'encoder-cell' : ''} ${isSliderCell(rowIndex, colIndex) ? 'slider-cell' : ''} ${isPotentiometerCell(rowIndex, colIndex) ? 'potentiometer-cell' : ''} ${isMagneticSwitchCell(rowIndex, colIndex) ? 'magnetic-switch-cell' : ''} ${activeEncoderMenu && activeEncoderMenu.row === rowIndex && activeEncoderMenu.col === colIndex ? 'active-encoder' : ''}`}>
                                                 {#if isSliderCell(rowIndex, colIndex)}
                                                     <!-- Slider component -->
                                                     {@const sliderId = sliderIdForCell(rowIndex, colIndex)}
@@ -2642,6 +2946,109 @@
                                                                             updateSliderConfig(sliderId, { max_midi_value: max });
                                                                         }}
                                                                     />
+                                                                </div>
+                                                            </div>
+                                                        </div>
+                                                    {/if}
+                                                {:else if isMagneticSwitchCell(rowIndex, colIndex)}
+                                                    <!-- Magnetic Switch component -->
+                                                    {@const switchId = magneticSwitchIdForCell(rowIndex, colIndex)}
+                                                    {@const switchValue = getMagneticSwitchValue(switchId)}
+                                                    {@const switchConfig = getMagneticSwitchConfig(switchId)}
+                                                    {@const switchPercentage = getMagneticSwitchPercentage(switchId)}
+                                                    {@const isPressed = isMagneticSwitchPressed(switchId)}
+                                                    <button
+                                                        class="magnetic-switch-container"
+                                                        class:pressed={isPressed}
+                                                        onclick={(event) => toggleMagneticSwitchMenu(rowIndex, colIndex, event)}
+                                                        aria-label={`Magnetic Switch ${switchId} at R${rowIndex}C${colIndex}, value ${switchPercentage}%`}
+                                                    >
+                                                        <div class="magnetic-switch-visual">
+                                                            <div class="magnetic-switch-bar">
+                                                                <div class="magnetic-switch-fill" style="height: {switchPercentage}%;"></div>
+                                                            </div>
+                                                            <div class="magnetic-switch-threshold" style="bottom: {switchConfig.sensitivity}%;"></div>
+                                                        </div>
+                                                        <div class="magnetic-switch-text">
+                                                            <div>MAG</div>
+                                                            <div>{switchPercentage}%</div>
+                                                            <div>{switchConfig.is_calibrated ? 'CAL' : 'RAW'}</div>
+                                                        </div>
+                                                    </button>
+                                                    
+                                                    <!-- Magnetic Switch Configuration Menu -->
+                                                    {#if activeMagneticSwitchMenu && activeMagneticSwitchMenu.row === rowIndex && activeMagneticSwitchMenu.col === colIndex}
+                                                        <div class="magnetic-switch-menu active">
+                                                            <div class="magnetic-switch-config-panel">
+                                                                <h3>Magnetic Switch Configuration</h3>
+                                                                
+                                                                <!-- Calibration Section -->
+                                                                <div class="magnetic-switch-config-section">
+                                                                    <span>Calibration</span>
+                                                                    {#if !switchConfig.is_calibrated}
+                                                                        <button onclick={() => startMagneticSwitchCalibration(switchId)}>
+                                                                            Start Calibration
+                                                                        </button>
+                                                                        <p class="calibration-help">Calibration required for accurate trigger detection</p>
+                                                                    {:else}
+                                                                        <div class="calibration-status">
+                                                                            <span class="calibrated">✓ Calibrated</span>
+                                                                            <button onclick={() => startMagneticSwitchCalibration(switchId)}>
+                                                                                Recalibrate
+                                                                            </button>
+                                                                        </div>
+                                                                    {/if}
+                                                                    
+                                                                    {#if calibrationMode[switchId]}
+                                                                        <div class="calibration-steps">
+                                                                            {#if calibrationMode[switchId] === 'ready'}
+                                                                                <p>Step 1: Release the switch, then click below</p>
+                                                                                <button onclick={() => setMagneticSwitchUnpressed(switchId)}>
+                                                                                    Set Unpressed Value
+                                                                                </button>
+                                                                            {:else if calibrationMode[switchId] === 'unpressed'}
+                                                                                <p>Step 2: Fully press the switch, then click below</p>
+                                                                                <button onclick={() => setMagneticSwitchPressed(switchId)}>
+                                                                                    Set Pressed Value
+                                                                                </button>
+                                                                            {:else if calibrationMode[switchId] === 'pressed'}
+                                                                                <p>Step 3: Calibration complete</p>
+                                                                                <button onclick={() => completeMagneticSwitchCalibration(switchId)}>
+                                                                                    Finish Calibration
+                                                                                </button>
+                                                                            {/if}
+                                                                        </div>
+                                                                    {/if}
+                                                                </div>
+                                                                
+                                                                <!-- Sensitivity Section -->
+                                                                {#if switchConfig.is_calibrated}
+                                                                    <div class="magnetic-switch-config-section">
+                                                                        <label for="sensitivity-{switchId}">Sensitivity: {switchConfig.sensitivity}%</label>
+                                                                        <input 
+                                                                            id="sensitivity-{switchId}"
+                                                                            type="range" 
+                                                                            min="1" 
+                                                                            max="100" 
+                                                                            value={switchConfig.sensitivity}
+                                                                            onchange={(e) => {
+                                                                                let sensitivity = parseInt(e.target.value);
+                                                                                setMagneticSwitchSensitivity(switchId, sensitivity);
+                                                                            }}
+                                                                        />
+                                                                        <p class="sensitivity-help">Lower = more sensitive</p>
+                                                                    </div>
+                                                                {/if}
+                                                                
+                                                                <!-- Key Assignment Section -->
+                                                                <div class="magnetic-switch-config-section">
+                                                                    <span>Assigned Key</span>
+                                                                    <button 
+                                                                        class="key-assignment-button"
+                                                                        onclick={() => openKeyModal(rowIndex, colIndex)}
+                                                                    >
+                                                                        {formatKeyLabel(switchConfig.keycode).join(' ')}
+                                                                    </button>
                                                                 </div>
                                                             </div>
                                                         </div>
@@ -4299,6 +4706,187 @@
         box-shadow: 
             0 8px 32px rgba(0, 0, 0, 0.12),
             0 0 0 1px rgba(0, 0, 0, 0.04);
+    }
+
+    /* Magnetic Switch Styles */
+    .magnetic-switch-cell {
+        position: relative;
+    }
+
+    .magnetic-switch-container {
+        width: 100%;
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        background: #ffffff;
+        border: 1px solid #d1d1d6;
+        border-radius: 8px;
+        position: relative;
+        cursor: pointer;
+        box-shadow: 
+            0 1px 3px rgba(0, 0, 0, 0.04),
+            0 0 0 1px rgba(0, 0, 0, 0.02);
+        transition: all 0.2s ease;
+        padding: 8px;
+    }
+
+    .magnetic-switch-container:hover {
+        border-color: rgba(0, 122, 255, 0.5);
+        transform: translateY(-1px);
+        box-shadow: 
+            0 4px 12px rgba(0, 122, 255, 0.12),
+            0 0 0 1px rgba(0, 122, 255, 0.2);
+    }
+
+    .magnetic-switch-container.pressed {
+        background: rgba(255, 59, 48, 0.1);
+        border-color: #ff3b30;
+    }
+
+    .magnetic-switch-visual {
+        position: relative;
+        width: 20px;
+        height: 40px;
+        margin-bottom: 8px;
+    }
+
+    .magnetic-switch-bar {
+        width: 100%;
+        height: 100%;
+        background: #f2f2f7;
+        border-radius: 4px;
+        position: relative;
+        overflow: hidden;
+    }
+
+    .magnetic-switch-fill {
+        position: absolute;
+        bottom: 0;
+        left: 0;
+        width: 100%;
+        background: linear-gradient(to top, #007aff, #5ac8fa);
+        border-radius: 4px;
+        transition: height 0.1s ease;
+    }
+
+    .magnetic-switch-threshold {
+        position: absolute;
+        left: -2px;
+        right: -2px;
+        height: 2px;
+        background: #ff3b30;
+        border-radius: 1px;
+    }
+
+    .magnetic-switch-text {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        font-size: 10px;
+        font-weight: 600;
+        color: #1d1d1f;
+        line-height: 1.2;
+    }
+
+    .magnetic-switch-menu {
+        position: absolute;
+        top: 50%;
+        transform: translateY(-50%);
+        left: 100%;
+        margin-left: 12px;
+        z-index: 200;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.2s ease;
+    }
+
+    .magnetic-switch-menu.active {
+        opacity: 1;
+        pointer-events: auto;
+    }
+
+    .magnetic-switch-config-panel {
+        width: 320px;
+        padding: 20px;
+        background: #ffffff;
+        border: 1px solid #d1d1d6;
+        border-radius: 16px;
+        box-shadow: 
+            0 8px 32px rgba(0, 0, 0, 0.12),
+            0 0 0 1px rgba(0, 0, 0, 0.04);
+    }
+
+    .magnetic-switch-config-panel h3 {
+        margin: 0 0 16px 0;
+        font-size: 16px;
+        font-weight: 600;
+        color: #1d1d1f;
+    }
+
+    .magnetic-switch-config-section {
+        margin-bottom: 16px;
+    }
+
+    .magnetic-switch-config-section span,
+    .magnetic-switch-config-section label {
+        display: block;
+        font-size: 13px;
+        font-weight: 600;
+        color: #1d1d1f;
+        margin-bottom: 8px;
+    }
+
+    .calibration-status {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 8px;
+    }
+
+    .calibrated {
+        color: #30d158;
+        font-weight: 600;
+        font-size: 12px;
+    }
+
+    .calibration-steps {
+        margin-top: 12px;
+        padding: 12px;
+        background: #f2f2f7;
+        border-radius: 8px;
+    }
+
+    .calibration-steps p {
+        margin: 0 0 8px 0;
+        font-size: 12px;
+        color: #1d1d1f;
+    }
+
+    .calibration-help,
+    .sensitivity-help {
+        margin: 4px 0 0 0;
+        font-size: 11px;
+        color: #8e8e93;
+    }
+
+    .key-assignment-button {
+        width: 100%;
+        padding: 8px 12px;
+        background: #f2f2f7;
+        border: 1px solid #d1d1d6;
+        border-radius: 6px;
+        font-size: 12px;
+        font-weight: 500;
+        color: #1d1d1f;
+        cursor: pointer;
+        transition: all 0.2s ease;
+    }
+
+    .key-assignment-button:hover {
+        background: #e8e8ed;
+        border-color: #b8b8be;
     }
 
     .save-button {

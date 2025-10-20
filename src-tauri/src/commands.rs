@@ -1,5 +1,5 @@
 use crate::hid_manager::{HidManager, DeviceDescriptor};
-use crate::protocol::{DeviceInfo, KeymapEntry, EncoderEntry, I2CDeviceInfo, SlaveKeymapEntry, SlaveEncoderEntry, BoardLayoutInfo, LayerState, LayoutCellType, LayoutCell, SliderConfig};
+use crate::protocol::{DeviceInfo, KeymapEntry, EncoderEntry, I2CDeviceInfo, SlaveKeymapEntry, SlaveEncoderEntry, BoardLayoutInfo, LayerState, LayoutCellType, LayoutCell, SliderConfig, MagneticSwitchConfig};
 use std::sync::Arc;
 use tauri::{AppHandle, State, Emitter};
 use tokio::sync::RwLock;
@@ -112,6 +112,36 @@ pub async fn get_slider_config(layer: u8, slider_id: u8, state: State<'_, AppSta
 pub async fn set_slider_config(config: SliderConfig, state: State<'_, AppState>) -> Result<(), String> {
     let manager = state.read().await;
     manager.set_slider_config(&config).await
+}
+
+#[tauri::command]
+pub async fn get_magnetic_switch_value(switch_id: u8, state: State<'_, AppState>) -> Result<u8, String> {
+    let manager = state.read().await;
+    manager.get_magnetic_switch_value(switch_id).await
+}
+
+#[tauri::command]
+pub async fn get_magnetic_switch_config(layer: u8, switch_id: u8, state: State<'_, AppState>) -> Result<MagneticSwitchConfig, String> {
+    let manager = state.read().await;
+    manager.get_magnetic_switch_config(layer, switch_id).await
+}
+
+#[tauri::command]
+pub async fn set_magnetic_switch_config(config: MagneticSwitchConfig, state: State<'_, AppState>) -> Result<(), String> {
+    let manager = state.read().await;
+    manager.set_magnetic_switch_config(&config).await
+}
+
+#[tauri::command]
+pub async fn calibrate_magnetic_switch(switch_id: u8, step: u8, state: State<'_, AppState>) -> Result<(), String> {
+    let manager = state.read().await;
+    manager.calibrate_magnetic_switch(switch_id, step).await
+}
+
+#[tauri::command]
+pub async fn set_magnetic_switch_sensitivity(switch_id: u8, sensitivity: u8, state: State<'_, AppState>) -> Result<(), String> {
+    let manager = state.read().await;
+    manager.set_magnetic_switch_sensitivity(switch_id, sensitivity).await
 }
 
 #[tauri::command]

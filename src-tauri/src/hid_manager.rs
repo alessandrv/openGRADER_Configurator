@@ -592,6 +592,72 @@ impl HidManager {
         Ok(())
     }
 
+    /// Get current magnetic switch value (0-100% press)
+    pub async fn get_magnetic_switch_value(&self, switch_id: u8) -> Result<u8, String> {
+        let payload = [switch_id];
+        let response = self.send_command(ConfigCommand::GetMagneticSwitchValue, &payload).await?;
+        let status = StatusCode::from(response.status);
+        if !matches!(status, StatusCode::Ok) {
+            return Err(format!("Device returned error: {:?}", status));
+        }
+
+        if response.payload_length < 3 {
+            return Err("Invalid response payload length".to_string());
+        }
+
+        // Response payload: [raw_low, raw_high, percentage]
+        // We want the percentage (third byte)
+        Ok(response.payload[2])
+    }
+
+    /// Get magnetic switch configuration
+    pub async fn get_magnetic_switch_config(&self, layer: u8, switch_id: u8) -> Result<MagneticSwitchConfig, String> {
+        let payload = [layer, switch_id];
+        let response = self.send_command(ConfigCommand::GetMagneticSwitchConfig, &payload).await?;
+        let status = StatusCode::from(response.status);
+        if !matches!(status, StatusCode::Ok) {
+            return Err(format!("Device returned error: {:?}", status));
+        }
+
+        MagneticSwitchConfig::from_payload(&response.payload[..response.payload_length as usize])
+    }
+
+    /// Set magnetic switch configuration
+    pub async fn set_magnetic_switch_config(&self, config: &MagneticSwitchConfig) -> Result<(), String> {
+        let payload = config.to_payload();
+        let response = self.send_command(ConfigCommand::SetMagneticSwitchConfig, &payload).await?;
+        let status = StatusCode::from(response.status);
+        if !matches!(status, StatusCode::Ok) {
+            return Err(format!("Device returned error: {:?}", status));
+        }
+
+        Ok(())
+    }
+
+    /// Calibrate magnetic switch (step: 0=start, 1=set_unpressed, 2=set_pressed, 3=complete)
+    pub async fn calibrate_magnetic_switch(&self, switch_id: u8, step: u8) -> Result<(), String> {
+        let payload = [switch_id, step];
+        let response = self.send_command(ConfigCommand::CalibrateMagneticSwitch, &payload).await?;
+        let status = StatusCode::from(response.status);
+        if !matches!(status, StatusCode::Ok) {
+            return Err(format!("Device returned error: {:?}", status));
+        }
+
+        Ok(())
+    }
+
+    /// Set magnetic switch sensitivity (0-100%)
+    pub async fn set_magnetic_switch_sensitivity(&self, switch_id: u8, sensitivity: u8) -> Result<(), String> {
+        let payload = [switch_id, sensitivity];
+        let response = self.send_command(ConfigCommand::SetMagneticSwitchSensitivity, &payload).await?;
+        let status = StatusCode::from(response.status);
+        if !matches!(status, StatusCode::Ok) {
+            return Err(format!("Device returned error: {:?}", status));
+        }
+
+        Ok(())
+    }
+
     /// Get device information
     pub async fn get_device_info(&self) -> Result<DeviceInfo, String> {
         // Handle mock device
